@@ -1,0 +1,2 @@
+requests>=2.25.0
+paramiko>=2.7.0  # 可选：用于SSH密码认证（如果未安装，会尝试使用sshpass或plink）
