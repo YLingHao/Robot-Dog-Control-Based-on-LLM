@@ -338,16 +338,24 @@ class DogCommandExecutor:
         self._wait_motion_stable(timeout=4.0)
         logging.info(f"当前: {self._cur_state}, 目标: {target}。尝试切换...")
         for attempt in range(2):
-            self._perform_action(0x21010202, 0)  # 站立/趴下切换
+            try:
+                self._perform_action(0x21010202, 0)  # 站立/趴下切换
+            except Exception as e:
+                logging.error(f"切换到目标状态 {target} 时发送指令异常: {e}")
+                break
+
             time.sleep(0.5)  # 给状态切换一点时间
             if self._wait_for_state(target, timeout=timeout):
                 logging.info(f"成功切换到: {self._cur_state}")
                 # 切换成功后，等待动作稳定
                 self._wait_motion_stable(timeout=3.0)
                 return
+
             logging.warning(f"等待 {target} 超时 (第{attempt+1}次)，重试...")
             self._wait_motion_stable(timeout=2.0)
-        raise RuntimeError(f"无法进入目标状态: {target}")
+
+        # 到这里仍未成功，不再抛异常，避免整个任务进程崩溃，只记录错误并继续后续动作
+        logging.error(f"无法可靠进入目标状态: {target}，后续动作将在当前状态 {self._cur_state} 下继续执行")
 
     def _run_repeat_action(self, code: int, seconds: float, val: int) -> None:
         th = MyRepeatThread(f"ACTION_{hex(code)}", self._perform_action, 0.1, seconds, code, val, 0)
@@ -367,8 +375,70 @@ class DogCommandExecutor:
         time.sleep(0.5)  # 给模式切换足够时间
         self._wait_motion_stable(timeout=3.0)
 
+    def _exec_moonwalk(self) -> None:
+        """太空步 0x2101030C 的专用执行逻辑，直接按 gesture_main.py 的实现移植。
+
+        gesture_main.py 中的逻辑：
+        1. 如果当前状态是 [6,0,0]（站立），则发送 ACTION_MOONWALK；
+        2. 循环监听状态，当状态变为 [6,12,1] 时，认为太空步进入执行；
+        3. sleep(4) 秒；
+        4. 发送 0x21010202 收尾；
+        5. 结束，不做额外状态修正，让下一个动作自己根据前置状态处理。
+        """
+        logging.info("执行太空步 0x2101030C（完全按 gesture_main 风格）...")
+
+        try:
+            # 1. 仅当当前是站立 [6,0,0] 时才执行太空步，否则直接跳过
+            try:
+                cur = status_listener()
+            except Exception as e:
+                logging.error(f"太空步前读取状态失败，放弃执行本次太空步: {e}")
+                return
+
+            if not (isinstance(cur, (list, tuple)) and len(cur) >= 3 and cur[0] == 6 and cur[1] == 0 and cur[2] == 0):
+                logging.warning(f"当前状态不是站立[6,0,0]({cur})，不执行太空步，直接继续后续动作")
+                return
+
+            # 2. 发送太空步指令（等价于 gesture_main 里的 ACTION_MOONWALK）
+            self._perform_action(0x2101030C, 0)
+
+            # 3. 等待进入执行状态 [6,12,1]，超时则放弃，不做收尾
+            logging.info("已发送太空步指令，等待状态变为[6,12,1]...")
+            start = time.time()
+            entered = False
+            while time.time() - start < 8.0:
+                st = status_listener()
+                if isinstance(st, (list, tuple)) and len(st) >= 3 and st[0] == 6 and st[1] == 12 and st[2] == 1:
+                    logging.info("检测到太空步执行状态 [6,12,1]，开始计时 4 秒（参考 gesture_main）...")
+                    entered = True
+                    break
+                time.sleep(0.05)
+
+            if not entered:
+                logging.warning("在 8 秒内没有检测到太空步执行状态 [6,12,1]，放弃收尾，继续后续动作")
+                return
+
+            # 4. 进入执行状态后 sleep(4)，然后发送 0x21010202 收尾（与 gesture_main 一致）
+            time.sleep(4.0)
+            logging.info("太空步计时 4 秒结束，发送收尾动作 0x21010202（与 gesture_main 一致）...")
+            self._perform_action(0x21010202, 0)
+
+            # 5. 不做强制姿态修正，只简单记一次状态，交给后续动作自己处理
+            self._refresh_state(timeout=1.0)
+            logging.info(f"太空步收尾完成，当前状态: {self._cur_state}，后续动作将根据自身前置状态继续执行")
+
+        except Exception as e:
+            # 任何没预料到的异常都吞掉，只打日志，绝不让整个进程崩溃
+            logging.error(f"太空步执行过程中出现未捕获异常，将跳过本动作继续后续动作: {e}")
+
     def _exec_motion(self, code: int, param: float, semantic: Optional[str]) -> None:
         """执行单个动作，参考gesture_main和precise_control_main的设计"""
+
+        # 太空步单独走一条“仿 gesture_main”的专用流程，避免在通用逻辑里引入过多分支导致不稳定
+        if code == 0x2101030C:
+            self._exec_moonwalk()
+            return
+
         need_state = PREREQUISITE_STATE.get(code)
         if need_state: 
             self._ensure_state(need_state)
