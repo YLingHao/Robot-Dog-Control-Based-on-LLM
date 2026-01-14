@@ -10,4 +10,4 @@
   -Headers @{ "Content-Type" = "application/json" } `
   -Body '{"actions": [{ "code": "0x21010130", "param": 1.3, "semantic": "move_x" },{ "code": "0x21010135", "param": -45, "semantic": "move_yaw" },{ "code": "0x21010130", "param": 1.3, "semantic": "move_x" },{ "code": "0x21010204" },{ "code": "0x2101020D" },{ "code": "0x2101050B" },{ "code": "0x21010507" },{ "code": "0x2101030C" },{ "code": "0x21010130", "param": 1.3, "semantic": "move_x" }]}'
 
-  机器狗会执行连续动作，通过curl "http://192.168.1.100:8000/result?task_id=[输入动作id]"可以查看动作执行详细情况
+  机器狗会执行连续动作，通过(Invoke-WebRequest "http://192.168.1.100:8000/result?task_id=[输入动作id]").Content可以查看动作执行详细情况
