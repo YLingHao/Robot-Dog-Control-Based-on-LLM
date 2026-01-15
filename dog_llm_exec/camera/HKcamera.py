@@ -209,6 +209,41 @@ class CameraManager:
     def __del__(self):
         close_device(self.cam)
 
+# 全局变量，用于 getImage() 函数
+deviceList = None
+cam = None
+data_buf = None
+nPayloadSize = None
+
+def _init_globals():
+    """初始化全局变量（延迟初始化）"""
+    global deviceList, cam, data_buf, nPayloadSize
+    if cam is None:
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
+        Enum_device(tlayerType, deviceList)
+        cam, data_buf, nPayloadSize = enable_device(0)
+        cam.MV_CC_SetFloatValue("ExposureTime", 120000.0)
+
+def getImage():
+    """获取图像（兼容旧接口）"""
+    global cam, data_buf, nPayloadSize
+    if cam is None:
+        _init_globals()
+    image = get_image(cam, data_buf, nPayloadSize)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.rotate(image, cv2.ROTATE_180)
+    image = cv2.resize(image, dsize=(640, 480))
+    return image
+
+def closeDevice():
+    """关闭设备（兼容旧接口）"""
+    global cam, data_buf
+    if cam is not None:
+        close_device(cam)
+        cam = None
+        data_buf = None
+
 if __name__ == "__main__":
     print("作为单独脚本运行，默认输出图像信息...")
     cam_manager = CameraManager()

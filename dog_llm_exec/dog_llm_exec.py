@@ -15,6 +15,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -32,6 +33,14 @@ from socketnetwork import network_utils
 from speeds.sportspeed import go_straight, translate_left_and_right, revolve_left_and_right
 from threading_utils.ThreadTemplates import MyRepeatThread
 from robotstatuswatcher.listener import status_listener
+
+# 避障功能（可选）
+try:
+    from obstacle_avoidance import ObstacleAvoidanceManager
+    OBSTACLE_AVOIDANCE_AVAILABLE = True
+except ImportError:
+    OBSTACLE_AVOIDANCE_AVAILABLE = False
+    logging.warning("避障功能不可用（缺少 obstacle_avoidance 模块）")
 
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
@@ -137,7 +146,7 @@ class RobotStatusWatcher:
 
 
 class DogCommandExecutor:
-    def __init__(self, dog_ip: str, dog_port: int = 43893):
+    def __init__(self, dog_ip: str, dog_port: int = 43893, enable_obstacle_avoidance: bool = True):
         self.sfd, self.target_address = network_utils.setup_socket_and_address(dog_ip, dog_port)
 
         self._heartbeat_thread = MyRepeatThread("HeartbeatThread", self._safe_send_heartbeat, 0.25, None)
@@ -149,6 +158,22 @@ class DogCommandExecutor:
         self._perform_action(0x21010C02)  # 手动模式
         time.sleep(0.1)
         self._refresh_state(timeout=3.0)
+        
+        # 初始化避障管理器（如果可用且启用）
+        self._obstacle_manager = None
+        if enable_obstacle_avoidance and OBSTACLE_AVOIDANCE_AVAILABLE:
+            try:
+                self._obstacle_manager = ObstacleAvoidanceManager(
+                    self.sfd, 
+                    self.target_address,
+                    enable_radar=True,
+                    enable_camera=True
+                )
+                self._obstacle_manager.start()
+                logging.info("避障功能已启用")
+            except Exception as e:
+                logging.warning(f"避障管理器初始化失败: {e}，避障功能将不可用")
+                self._obstacle_manager = None
 
     def close(self) -> None:
         try: self._status.stop()
@@ -156,6 +181,10 @@ class DogCommandExecutor:
         try:
             self._heartbeat_thread.stop()
             self._heartbeat_thread.join(timeout=1.0)
+        except: pass
+        try:
+            if self._obstacle_manager:
+                self._obstacle_manager.stop()
         except: pass
         try: self.sfd.close()
         except: pass
@@ -361,6 +390,71 @@ class DogCommandExecutor:
         th = MyRepeatThread(f"ACTION_{hex(code)}", self._perform_action, 0.1, seconds, code, val, 0)
         th.start()
         th.join()
+    
+    def _run_repeat_action_with_obstacle_check(self, code: int, seconds: float, val: int, semantic: str, param: float) -> None:
+        """执行重复动作，并在执行过程中检测障碍物、楼梯、坑洞"""
+        if not self._obstacle_manager:
+            # 如果没有避障管理器，使用普通执行方式
+            self._run_repeat_action(code, seconds, val)
+            return
+        
+        # 重置避障计数器（新的动作序列）
+        self._obstacle_manager.reset_counters()
+        
+        # 创建动作线程
+        th = MyRepeatThread(f"ACTION_{hex(code)}", self._perform_action, 0.1, seconds, code, val, 0)
+        th.start()
+        
+        # 在执行过程中实时检测障碍物
+        check_interval = 0.1  # 100ms检测一次
+        
+        while th.is_alive():
+            # 检测障碍物（仅对前进动作）
+            if semantic == "move_x" and self._obstacle_manager.handle_obstacle(th, (param,), 0.0):
+                logging.warning("检测到障碍物，已执行避障序列")
+                # 避障后，计算剩余距离并继续前进
+                # before_long 会在 handle_obstacle 内部计算
+                try:
+                    if hasattr(th, 'print_attributes'):
+                        attrs = th.print_attributes()
+                        current_time_start = attrs.get('current_time_start', 0)
+                        before_long = go_straight(
+                            long=9999,
+                            times=current_time_start,
+                            obs_void_distance=self._obstacle_manager.obs_void_distance
+                        )
+                    else:
+                        before_long = 0.0
+                except Exception as e:
+                    logging.warning(f"计算已前进距离失败: {e}")
+                    before_long = 0.0
+                
+                # 避障后，更新剩余距离
+                temp = 2 * self._obstacle_manager.avoid_actions_params[1][0][0] / math.sqrt(2)
+                remaining_distance = param - before_long - temp
+                if remaining_distance > 0:
+                    logging.info(f"避障后继续前进剩余距离: {remaining_distance:.3f}m")
+                    # 继续执行剩余距离
+                    times, val = go_straight(remaining_distance, 3)
+                    self._run_repeat_action(code, times, val)
+                break
+            
+            # 检测楼梯
+            if self._obstacle_manager.handle_staircase():
+                logging.warning("检测到楼梯，已暂停机器狗")
+                th.stop()
+                break
+            
+            # 检测坑洞
+            if self._obstacle_manager.handle_hole():
+                logging.warning("检测到坑洞，已暂停机器狗")
+                th.stop()
+                break
+            
+            time.sleep(check_interval)
+        
+        # 等待线程结束
+        th.join()
 
     def _has_move(self, actions: List[Dict[str, Any]]) -> bool:
         return any(a.get("semantic") in MOVE_CODE for a in actions)
@@ -458,8 +552,8 @@ class DogCommandExecutor:
             else: 
                 raise ValueError("未知移动语义")
             
-            # 执行移动动作
-            self._run_repeat_action(code, times, val)
+            # 执行移动动作（带避障检测）
+            self._run_repeat_action_with_obstacle_check(code, times, val, semantic, param)
             # 完全停止（参考precise_control_main的1秒停顿）
             self._send_stop_motion()
             return

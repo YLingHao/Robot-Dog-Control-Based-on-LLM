@@ -15,11 +15,16 @@ limitations under the License.
 """
 
 import time
+import warnings
 
 import cv2
 import numpy as np
 import torch
-import torchvision
+
+# 抑制 torchvision 的 image extension 警告（这是已知问题，不影响功能）
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message=".*Failed to load image Python extension.*")
+    import torchvision
 
 
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=False, scaleFill=False, scaleup=True):

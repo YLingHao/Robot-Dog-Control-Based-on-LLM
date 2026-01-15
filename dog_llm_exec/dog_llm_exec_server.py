@@ -20,10 +20,12 @@
 - 子进程会单独创建UDP socket/状态监听端口，因此同一时间只允许一个任务 running。
 """
 
+import io
 import json
 import logging
 import multiprocessing as mp
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -33,10 +35,147 @@ from typing import Any, Dict, Optional
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
 
+# 日志收集器：收集所有日志输出
+class LogCollector:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._logs: list = []
+        self._max_logs = 1000  # 最多保存1000条日志
+        
+    def append(self, log_entry: str):
+        with self._lock:
+            self._logs.append(log_entry)
+            # 保持日志数量在限制内
+            if len(self._logs) > self._max_logs:
+                self._logs = self._logs[-self._max_logs:]
+    
+    def get_logs(self, since: int = 0) -> list:
+        """获取日志，since 是起始索引"""
+        with self._lock:
+            return self._logs[since:]
+    
+    def clear(self):
+        with self._lock:
+            self._logs.clear()
 
-def _worker_run(task_id: str, payload: Dict[str, Any], dog_ip: str, dog_port: int, result_queue: "mp.Queue") -> None:
+# 全局日志收集器
+_log_collector = LogCollector()
+
+# 用于子进程传递日志的队列
+_log_queue: Optional[mp.Queue] = None
+
+# 自定义日志处理器，将日志输出到收集器
+class LogCollectorHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        # 不过滤，所有日志都收集
+        _log_collector.append(log_entry)
+        # 如果是子进程，也发送到队列
+        if _log_queue is not None:
+            try:
+                _log_queue.put_nowait(("log", log_entry))
+            except:
+                pass
+
+# 添加日志收集器到根 logger
+_log_handler = LogCollectorHandler()
+_log_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logging.getLogger().addHandler(_log_handler)
+
+# 用于捕获 print() 和 stderr 的流包装器
+class LogStream(io.TextIOBase):
+    """将 stdout/stderr 输出转换为日志的流包装器"""
+    def __init__(self, name: str, original_stream, log_queue: Optional["mp.Queue"] = None):
+        self.name = name
+        self.original_stream = original_stream
+        self.log_queue = log_queue
+        self.buffer = []  # 用于缓冲不完整的行
+        
+    def write(self, text: str) -> int:
+        # 捕获所有输出（包括空行和多行输出）
+        if text:
+            # 将新文本添加到缓冲区
+            self.buffer.append(text)
+            
+            # 检查是否有完整的行（以换行符结尾）
+            buffered_text = ''.join(self.buffer)
+            if '\n' in buffered_text:
+                # 按行分割
+                lines = buffered_text.split('\n')
+                # 最后一部分（可能不完整）保留在缓冲区
+                self.buffer = [lines[-1]] if lines[-1] else []
+                
+                # 处理完整的行
+                for line in lines[:-1]:
+                    line = line.rstrip('\r')
+                    # 发送每一行到日志队列（添加时间戳，与logging格式一致）
+                    if self.log_queue is not None:
+                        try:
+                            import datetime
+                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            # 如果行不为空，添加时间戳；空行也保留（某些库用空行作为分隔）
+                            formatted_line = f"[{timestamp}] INFO {line}" if line else ""
+                            if formatted_line:
+                                self.log_queue.put_nowait(("print", formatted_line))
+                        except:
+                            pass
+        
+        return len(text)
+    
+    def flush(self):
+        # 刷新缓冲区中的内容
+        if self.buffer:
+            buffered_text = ''.join(self.buffer)
+            if buffered_text.strip():
+                if self.log_queue is not None:
+                    try:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        formatted_line = f"[{timestamp}] INFO {buffered_text.rstrip()}"
+                        self.log_queue.put_nowait(("print", formatted_line))
+                    except:
+                        pass
+            self.buffer = []
+        
+        if self.original_stream:
+            try:
+                self.original_stream.flush()
+            except:
+                pass
+
+
+def _worker_run(task_id: str, payload: Dict[str, Any], dog_ip: str, dog_port: int, result_queue: "mp.Queue", log_queue: "mp.Queue") -> None:
     """子进程执行入口。"""
+    global _log_queue
+    _log_queue = log_queue
+    
+    # 在子进程中设置日志收集器，将日志发送到队列
+    # 清除所有现有的 handler，避免日志重复输出
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    class WorkerLogHandler(logging.Handler):
+        def emit(self, record):
+            log_entry = self.format(record)
+            try:
+                log_queue.put_nowait(("log", log_entry))
+            except:
+                pass
+    
+    worker_handler = WorkerLogHandler()
+    worker_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    root_logger.addHandler(worker_handler)
+    root_logger.setLevel(logging.INFO)  # 设置日志级别
+    
+    # 重定向 stdout 和 stderr 到日志流
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = LogStream("stdout", original_stdout, log_queue)
+    sys.stderr = LogStream("stderr", original_stderr, log_queue)
+    
     try:
+        # 直接导入命令执行器（不再做依赖库检查）
         from dog_llm_exec import DogCommandExecutor  # 子进程内导入
 
         executor = DogCommandExecutor(dog_ip, dog_port)
@@ -69,6 +208,25 @@ def _worker_run(task_id: str, payload: Dict[str, Any], dog_ip: str, dog_port: in
         try:
             result_queue.put({"task_id": task_id, "status": "failed", "result": None, "error": str(e)})
         except Exception:
+            pass
+    finally:
+        # 确保所有日志都被发送（刷新缓冲区）
+        try:
+            if hasattr(sys.stdout, 'flush'):
+                sys.stdout.flush()
+            if hasattr(sys.stderr, 'flush'):
+                sys.stderr.flush()
+        except:
+            pass
+        
+        # 恢复原始 stdout/stderr
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        
+        # 发送一个结束标记，确保主进程知道子进程已退出
+        try:
+            log_queue.put(("done", ""))
+        except:
             pass
 
 
@@ -127,6 +285,7 @@ class CommandService:
 
         self._current_proc: Optional[mp.Process] = None
         self._current_task_id: Optional[str] = None
+        self._current_log_queue: Optional["mp.Queue"] = None
         self._result_queue: "mp.Queue" = mp.Queue()
 
         self._worker = threading.Thread(target=self._loop, daemon=True)
@@ -177,12 +336,44 @@ class CommandService:
             error = msg.get("error")
             self._tasks.update(task_id, status=status, result=result, error=error, finished_at=time.time())
 
+    def _drain_log_queue(self) -> None:
+        """处理子进程日志队列，将日志添加到主进程的日志收集器"""
+        if self._current_log_queue is None:
+            return
+        try:
+            # 使用超时机制，避免无限等待
+            max_iterations = 100  # 每次最多处理100条，避免阻塞
+            count = 0
+            while count < max_iterations:
+                try:
+                    # 使用超时避免阻塞
+                    msg_type, log_entry = self._current_log_queue.get(timeout=0.01)
+                    if msg_type in ("log", "print"):
+                        # 将子进程的日志添加到主进程的日志收集器
+                        _log_collector.append(log_entry)
+                    count += 1
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+        except Exception:
+            pass
+
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             self._drain_worker_results()
+            self._drain_log_queue()  # 处理日志队列
 
             # 回收当前子进程
             if self._current_proc is not None and not self._current_proc.is_alive():
+                # 处理剩余的日志（多次处理确保不遗漏）
+                for _ in range(10):  # 最多处理10轮，确保所有日志都被收集
+                    self._drain_log_queue()
+                    if self._current_log_queue is None:
+                        break
+                    # 短暂等待，让子进程有时间发送最后的日志
+                    time.sleep(0.05)
+                
                 exitcode = self._current_proc.exitcode
                 if self._current_task_id:
                     # 如果子进程异常退出且没上报结果，则标记failed
@@ -200,6 +391,7 @@ class CommandService:
 
                 self._current_proc = None
                 self._current_task_id = None
+                self._current_log_queue = None
 
             # 有任务在跑就不启动新任务
             if self._current_proc is not None:
@@ -218,14 +410,18 @@ class CommandService:
             payload = t.get("payload") or {}
             self._tasks.update(task_id, status="running", started_at=time.time())
 
+            # 创建子进程专用的日志队列
+            log_queue = mp.Queue()
+            
             proc = mp.Process(
                 target=_worker_run,
-                args=(task_id, payload, self._dog_ip, self._dog_port, self._result_queue),
+                args=(task_id, payload, self._dog_ip, self._dog_port, self._result_queue, log_queue),
                 daemon=True,
             )
             proc.start()
             self._current_proc = proc
             self._current_task_id = task_id
+            self._current_log_queue = log_queue
 
 
 _SERVICE: Optional[CommandService] = None
@@ -312,12 +508,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "task": t})
                 return
 
+            if self.path.startswith("/logs"):
+                # 获取日志，支持 since 参数（起始索引）
+                since = 0
+                if "?" in self.path:
+                    _, q = self.path.split("?", 1)
+                    for part in q.split("&"):
+                        if part.startswith("since="):
+                            try:
+                                since = int(part.split("=", 1)[1])
+                            except ValueError:
+                                pass
+                logs = _log_collector.get_logs(since)
+                self._send_json(200, {"ok": True, "logs": logs, "count": len(logs), "since": since})
+                return
+
             self._send_json(404, {"ok": False, "error": "not found"})
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        logging.info("%s - %s" % (self.address_string(), fmt % args))
+        message = fmt % args
+        # 完全跳过 /logs 轮询请求的日志记录（避免刷屏），这些请求本身是用于获取日志的，不需要记录
+        if "/logs" in message:
+            return
+        log_msg = "%s - %s" % (self.address_string(), message)
+        logging.info(log_msg)
 
 
 def main() -> None:

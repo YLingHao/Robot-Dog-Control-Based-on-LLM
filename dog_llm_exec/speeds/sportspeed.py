@@ -3,7 +3,7 @@
 
 from command.udp_command import *                       # 存放各种结构体与状态数据、指令
 
-def go_straight(long, speedgear=3):
+def go_straight(long, speedgear=3, times=None, obs_void_distance=None):
     # 档位速度只是参考值，具体速度按照实际来判断，默认速度是3档
     speedgear_ditc = {
         1:7000,
@@ -15,13 +15,21 @@ def go_straight(long, speedgear=3):
     }
 
     val = speedgear_ditc[speedgear]
+    
+    # 如果传入的是时间，计算出已经走过的距离,long传入9999是为在特殊情况才能会有下面的情况
+    if times is not None and obs_void_distance is not None and long == 9999:
+        speed_per_second_meter = (-7.237e-09) * val ** 2 + 0.0002933 * val - 1.66
+        # 这里要计算出避障的距离的时间消耗
+        times_obs_void_distance = obs_void_distance / speed_per_second_meter
+        long = abs((times - times_obs_void_distance) * speed_per_second_meter)
+        return long
 
     if long < 0:
         val = -val
         speed_per_second_meter = (-1.5059e-08) * val ** 2 - (4.1944e-04) * val - 2.1804
         times = abs(long / speed_per_second_meter)
     else:
-        speed_per_second_meter = (-7.237e-09) * val ** 2 + 0.0002933 * val - 1.643
+        speed_per_second_meter = (-7.237e-09) * val ** 2 + 0.0002933 * val - 1.66
         times = long / speed_per_second_meter
     return [times, val]
 
