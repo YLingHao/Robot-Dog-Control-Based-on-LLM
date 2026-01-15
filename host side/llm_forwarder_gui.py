@@ -20,6 +20,8 @@ import logging
 import queue
 import threading
 import time
+import os
+import tempfile
 from typing import Optional, Tuple
 
 import tkinter as tk
@@ -51,13 +53,24 @@ class ForwarderGUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("机器狗 LLM 监听转发程序")
-        self.root.geometry("980x720")
+        self.root.geometry("1040x760")
 
         # 当前 forwarder 实例（每次启动/终止可以重建）
         self._forwarder: Optional[LLMForwarder] = None
         self._running = False
         self._dog_log_index = 0  # 机器狗日志的起始索引
         self._dog_log_timer = None  # 日志轮询定时器
+
+        # 语音录制 / Whisper 相关状态
+        self._whisper_model = None          # 延迟加载的 Whisper small 模型
+        self._recording = False             # 是否正在录音
+        self._recording_thread = None       # 录音后台线程
+        self._recording_frames = []         # 录音采样数据列表
+        self._recording_fs = 16000          # 采样率（Whisper 推荐 16k）
+
+        # 上下文记忆：保存历史对话（最多保留 8K tokens）
+        self._conversation_history = []     # 历史对话列表，格式: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        self._max_context_tokens = 8000     # 最大上下文长度（tokens）
 
         # UI 组件
         self._build_widgets()
@@ -112,6 +125,9 @@ class ForwarderGUI:
         self.btn_stop = ttk.Button(btn_frame, text="终止", width=10, command=self.on_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
+        self.btn_clear_history = ttk.Button(btn_frame, text="清空历史", width=10, command=self.on_clear_history)
+        self.btn_clear_history.pack(side=tk.LEFT, padx=4)
+
         # 中部：对话与输出
         mid_frame = ttk.Frame(self.root)
         mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=5)
@@ -132,6 +148,15 @@ class ForwarderGUI:
 
         self.btn_send = ttk.Button(send_frame, text="发送", width=8, command=self.on_send, state=tk.DISABLED)
         self.btn_send.pack(side=tk.TOP, pady=2)
+
+        # 语音输入按钮（按一次开始录音，再按一次结束录音）
+        self.btn_voice = ttk.Button(send_frame, text="语音", width=8, command=self.on_voice_button)
+        self.btn_voice.pack(side=tk.TOP, pady=2)
+
+        # 语音自动发送开关
+        self.auto_send_var = tk.BooleanVar(value=False)
+        self.chk_auto_send = ttk.Checkbutton(send_frame, text="语音自动发送", variable=self.auto_send_var)
+        self.chk_auto_send.pack(side=tk.TOP, pady=2)
 
         # 模型输出（流式原始输出）
         out_frame = ttk.LabelFrame(left_frame, text="模型输出（原始，含 think 内容）")
@@ -274,9 +299,18 @@ class ForwarderGUI:
 
         self.root.after(0, _reset)
 
+    def on_clear_history(self) -> None:
+        """清空对话历史"""
+        self._conversation_history.clear()
+        logging.info("已清空对话历史，上下文记忆已重置")
+        messagebox.showinfo("提示", "对话历史已清空，下次对话将重新开始。")
+
     def on_stop(self) -> None:
+        # 停止时顺便清空上下文，避免下次启动时「记忆错乱」
         self._running = False
-        
+        self._conversation_history.clear()
+        logging.info("已停止监听服务并清空对话历史（上下文已重置）")
+
         # 停止机器狗日志轮询
         self._stop_dog_log_polling()
 
@@ -345,6 +379,218 @@ class ForwarderGUI:
         # 每500ms轮询一次
         self._dog_log_timer = self.root.after(500, self._poll_dog_logs)
 
+    # ------------------------------------------------------------------
+    # 语音输入 / Whisper 集成
+    # ------------------------------------------------------------------
+    def _ensure_whisper_model(self):
+        """延迟加载 Whisper small 模型。若未安装则给出友好提示。"""
+        if self._whisper_model is not None:
+            return self._whisper_model
+
+        try:
+            import whisper  # type: ignore
+        except ImportError:
+            msg = (
+                "未检测到 Whisper 库，无法进行语音转文本。\n\n"
+                "请在本机终端中执行以下命令安装（在 pytorch 虚拟环境里）：\n"
+                "  pip install -U openai-whisper\n\n"
+                "并确保已安装 ffmpeg。"
+            )
+            logging.error("未安装 whisper 库，语音转文本功能不可用。")
+            messagebox.showerror("缺少依赖", msg)
+            return None
+
+        logging.info("正在加载 Whisper small 模型（首次加载可能需要数十秒）...")
+        try:
+            model = whisper.load_model("small")
+        except Exception as e:
+            logging.error(f"加载 Whisper small 模型失败: {e}")
+            messagebox.showerror("错误", f"加载 Whisper 模型失败：{e}")
+            return None
+
+        self._whisper_model = model
+        logging.info("Whisper small 模型加载完成。")
+        return self._whisper_model
+
+    def on_voice_button(self) -> None:
+        """语音按钮：第一次点击开始录音，再次点击结束录音并转写。"""
+        # 若正在录音，则本次点击为“停止并转写”
+        if self._recording:
+            logging.info("结束录音，准备进行语音转文本...")
+            self._recording = False
+            # 按钮先禁用，等转写结束再恢复
+            self.btn_voice.config(state=tk.DISABLED, text="语音")
+            return
+
+        # 未在录音，则开始录音
+        def start_recording():
+            # 延迟导入录音依赖
+            try:
+                import sounddevice as sd  # type: ignore
+            except ImportError:
+                msg = (
+                    "未检测到录音相关库，无法从麦克风录音。\n\n"
+                    "请在本机终端中执行以下命令安装（在 pytorch 虚拟环境里）：\n"
+                    "  pip install -U sounddevice scipy\n"
+                )
+                logging.error("未安装 sounddevice/scipy，语音录音功能不可用。")
+                self.root.after(0, lambda: messagebox.showerror("缺少依赖", msg))
+                return
+
+            self._recording_frames = []
+            self._recording = True
+
+            def audio_worker():
+                import numpy as np  # type: ignore
+                from scipy.io.wavfile import write as wav_write  # type: ignore
+
+                try:
+                    fs = self._recording_fs
+
+                    def callback(indata, frames, time_info, status):
+                        if status:
+                            logging.warning(f"录音状态警告: {status}")
+                        # 复制一份数据到列表中
+                        self._recording_frames.append(indata.copy())
+
+                    import sounddevice as sd  # type: ignore
+                    logging.info("开始录音：再次点击“语音”按钮可结束录音。")
+                    with sd.InputStream(
+                        samplerate=fs,
+                        channels=1,
+                        dtype="int16",
+                        callback=callback,
+                    ):
+                        while self._recording:
+                            sd.sleep(100)
+                except Exception as e:
+                    logging.error(f"录音过程中出错: {e}")
+                    self.root.after(
+                        0, lambda: messagebox.showerror("录音失败", f"录音失败：{e}")
+                    )
+                    self.root.after(
+                        0, lambda: self.btn_voice.config(state=tk.NORMAL, text="语音")
+                    )
+                    return
+
+                # 录音结束，开始转写
+                if not self._recording_frames:
+                    logging.warning("未采集到任何音频样本。")
+                    self.root.after(
+                        0,
+                        lambda: (
+                            messagebox.showinfo("提示", "没有录到有效声音，请重试。"),
+                            self.btn_voice.config(state=tk.NORMAL, text="语音"),
+                        ),
+                    )
+                    return
+
+                # 拼接所有帧
+                try:
+                    import numpy as np  # type: ignore
+
+                    audio_data = np.concatenate(self._recording_frames, axis=0)
+                except Exception as e:
+                    logging.error(f"拼接录音数据失败: {e}")
+                    self.root.after(
+                        0, lambda: self.btn_voice.config(state=tk.NORMAL, text="语音")
+                    )
+                    return
+
+                model = self._ensure_whisper_model()
+                if model is None:
+                    self.root.after(
+                        0, lambda: self.btn_voice.config(state=tk.NORMAL, text="语音")
+                    )
+                    return
+
+                logging.info("录音结束，正在保存临时音频文件并调用 Whisper 转文本...")
+
+                tmp_path = None
+                try:
+                    from scipy.io.wavfile import write as wav_write  # type: ignore
+
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                        tmp_path = f.name
+                        wav_write(tmp_path, self._recording_fs, audio_data)
+
+                    # 调用 Whisper 进行中文转写（显式指定简体中文风格）
+                    try:
+                        result = model.transcribe(
+                            tmp_path,
+                            language="zh",
+                            task="transcribe",
+                            fp16=False,
+                            initial_prompt="请使用简体中文输出，不要使用繁体字。",
+                        )
+                    except Exception as e:
+                        logging.error(f"Whisper 转写失败: {e}")
+                        self.root.after(
+                            0,
+                            lambda: messagebox.showerror(
+                                "转写失败", f"Whisper 转写失败：{e}"
+                            ),
+                        )
+                        return
+
+                    text = (result.get("text") or "").strip()
+
+                    # 尝试将繁体转换为简体（如果系统安装了 opencc，则自动使用）
+                    try:
+                        from opencc import OpenCC  # type: ignore
+
+                        conv = OpenCC("t2s")
+                        text = conv.convert(text)
+                    except Exception:
+                        # 没装 opencc 或转换失败时，直接使用原文
+                        pass
+                    if not text:
+                        logging.warning("Whisper 未识别出有效文本。")
+                        self.root.after(
+                            0,
+                            lambda: messagebox.showinfo(
+                                "提示", "未识别到有效语音内容，请重试。"
+                            ),
+                        )
+                        return
+
+                    logging.info(f"Whisper 识别结果: {text}")
+
+                    def update_input_and_maybe_send():
+                        # 将识别结果填入输入框（覆盖原内容）
+                        self.text_request.delete("1.0", tk.END)
+                        self.text_request.insert(tk.END, text)
+
+                        # 根据开关决定是否自动发送
+                        if self.auto_send_var.get():
+                            if self._forwarder and self._running:
+                                logging.info("语音识别完成，自动发送到大模型。")
+                                self.on_send()
+                            else:
+                                logging.warning("当前未启动机器狗监听服务，自动发送已跳过。")
+
+                        # 恢复按钮状态
+                        self.btn_voice.config(state=tk.NORMAL, text="语音")
+
+                    self.root.after(0, update_input_and_maybe_send)
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+
+            # 启动录音后台线程
+            self._recording_thread = threading.Thread(
+                target=audio_worker, daemon=True
+            )
+            self._recording_thread.start()
+
+        # 切换到“录音中”状态
+        self._recording = True
+        self.btn_voice.config(text="停止")
+        threading.Thread(target=start_recording, daemon=True).start()
+
     def on_send(self) -> None:
         if not self._forwarder or not self._running:
             messagebox.showwarning("提示", "请先启动并连接机器狗。")
@@ -364,12 +610,17 @@ class ForwarderGUI:
 
         def worker():
             try:
-                logging.info("开始调用大模型（流式输出）...")
+                logging.info("开始调用大模型（流式输出，包含上下文记忆）...")
                 full_text = self._call_ollama_stream_gui(prompt)
 
                 if not full_text:
                     logging.warning("大模型未返回任何内容。")
                 else:
+                    # 保存对话历史：添加用户输入和助手回复
+                    self._conversation_history.append({"role": "user", "content": prompt})
+                    self._conversation_history.append({"role": "assistant", "content": full_text})
+                    logging.debug(f"已保存对话历史，当前历史记录数: {len(self._conversation_history) // 2} 轮")
+                    
                     # full_text 已经是过滤掉 think 后的纯 response 内容
                     # 直接显示到最终输出区域
                     self._append_text_safe(self.text_final, full_text + "\n")
@@ -393,19 +644,70 @@ class ForwarderGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # 大模型调用（GUI 版流式输出）
+    # 上下文记忆管理
+    # ------------------------------------------------------------------
+    def _estimate_tokens(self, text: str) -> int:
+        """简单估算文本的 token 数量（中文字符 * 1.5，英文单词 * 1.3）"""
+        # 中文字符数（包括中文标点）
+        chinese_chars = len([c for c in text if '\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u303f' or '\uff00' <= c <= '\uffef'])
+        # 英文单词数（简单按空格分割）
+        english_words = len(text.split()) - chinese_chars
+        # 估算 tokens（中文字符 * 1.5，英文单词 * 1.3）
+        estimated_tokens = int(chinese_chars * 1.5 + english_words * 1.3)
+        return max(estimated_tokens, len(text) // 4)  # 至少按字符数的 1/4 估算
+    
+    def _trim_conversation_history(self, new_user_message: str) -> None:
+        """修剪对话历史，确保不超过最大上下文长度"""
+        # 估算新消息的 tokens
+        new_tokens = self._estimate_tokens(new_user_message)
+        
+        # 计算当前历史的总 tokens
+        total_tokens = new_tokens
+        for msg in self._conversation_history:
+            total_tokens += self._estimate_tokens(msg.get("content", ""))
+        
+        # 如果超过限制，从最旧的对话开始删除
+        while total_tokens > self._max_context_tokens and len(self._conversation_history) > 0:
+            removed_msg = self._conversation_history.pop(0)
+            total_tokens -= self._estimate_tokens(removed_msg.get("content", ""))
+    
+    # ------------------------------------------------------------------
+    # 大模型调用（GUI 版流式输出，带上下文记忆）
     # ------------------------------------------------------------------
     def _call_ollama_stream_gui(self, prompt: str) -> str:
-        """参照 LLMForwarder.call_ollama_api 的流式实现，但输出到 GUI。"""
+        """
+        参照 LLMForwarder.call_ollama_api 的流式实现，但输出到 GUI。
+        使用 /api/generate 接口，并通过构造带历史对话的 prompt 来实现上下文记忆。
+        这样可以保持之前对 deepseek 等模型的 thinking 字段兼容。
+        """
+        import requests
+        import json
+
+        # 修剪对话历史，确保不超过最大上下文长度
+        self._trim_conversation_history(prompt)
+
+        # 将历史对话 + 当前用户输入拼接成一个大的 prompt
+        context_prompt = ""
+        for msg in self._conversation_history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not content:
+                continue
+            if role == "user":
+                context_prompt += f"用户: {content}\n\n"
+            elif role == "assistant":
+                context_prompt += f"助手: {content}\n\n"
+            else:
+                context_prompt += f"{content}\n\n"
+
+        context_prompt += f"用户: {prompt}\n\n助手:"
+
         api_url = f"{self._forwarder._ollama_url}/api/generate"
         payload = {
             "model": self._forwarder._model,
-            "prompt": prompt,
+            "prompt": context_prompt,
             "stream": True,
         }
-
-        import requests
-        import json
 
         try:
             resp = requests.post(api_url, json=payload, timeout=300, stream=True)
@@ -444,6 +746,7 @@ class ForwarderGUI:
                 data = json.loads(json_str)
 
                 # 提取thinking字段（思考过程）
+                thinking_chunk = None
                 if "thinking" in data:
                     thinking_chunk = data["thinking"]
                     if thinking_chunk:
@@ -454,22 +757,27 @@ class ForwarderGUI:
                         self._append_text_safe(self.text_model_output, thinking_chunk)
                         thinking_displayed_to_model = True
 
+                # /api/generate 接口返回的是 response 字段
+                # 注意：同一个 chunk 可能同时包含 thinking 和 response
+                response_chunk = None
                 if "response" in data:
-                    chunk = data["response"]
-                    if chunk:
+                    response_chunk = data["response"]
+                    # response 可能是空字符串，但我们需要处理它（累积到 full_response）
+                    if response_chunk is not None:  # 允许空字符串，但不允许 None
                         # 如果之前有think内容但还没显示到模型输出窗口，先显示
                         if full_thinking and not thinking_displayed_to_model:
-                            self._append_text_safe(self.text_model_output, full_thinking + "\n")
+                            self._append_text_safe(self.text_model_output, full_thinking)
                             thinking_displayed_to_model = True
                         
-                        full_response += chunk
-                        # 实时显示response到模型输出区域
-                        self._append_text_safe(self.text_model_output, chunk)
+                        full_response += response_chunk
+                        # 实时显示response到模型输出区域（紧跟在thinking后面）
+                        self._append_text_safe(self.text_model_output, response_chunk)
 
                 if data.get("done", False):
                     # 如果结束时还有think内容但没显示到模型输出窗口，显示它
                     if full_thinking and not thinking_displayed_to_model:
-                        self._append_text_safe(self.text_model_output, full_thinking + "\n")
+                        self._append_text_safe(self.text_model_output, full_thinking)
+                    # 确保最后有一个换行
                     break
 
                 if "error" in data:
