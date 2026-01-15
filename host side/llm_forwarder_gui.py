@@ -56,6 +56,8 @@ class ForwarderGUI:
         # 当前 forwarder 实例（每次启动/终止可以重建）
         self._forwarder: Optional[LLMForwarder] = None
         self._running = False
+        self._dog_log_index = 0  # 机器狗日志的起始索引
+        self._dog_log_timer = None  # 日志轮询定时器
 
         # UI 组件
         self._build_widgets()
@@ -168,16 +170,31 @@ class ForwarderGUI:
         scroll_final.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_final.configure(yscrollcommand=scroll_final.set)
 
-        # 底部日志
-        log_frame = ttk.LabelFrame(self.root, text="日志")
-        log_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=8, pady=5)
-
-        self.text_log = tk.Text(log_frame, height=8)
+        # 底部：主机日志 + 机器狗日志（分左右两栏）
+        bottom_frame = ttk.Frame(self.root)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=8, pady=5)
+        
+        # 左侧：主机日志
+        host_log_frame = ttk.LabelFrame(bottom_frame, text="主机日志")
+        host_log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+        
+        self.text_log = tk.Text(host_log_frame, height=8)
         self.text_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
-
-        scroll_log = ttk.Scrollbar(log_frame, command=self.text_log.yview)
+        
+        scroll_log = ttk.Scrollbar(host_log_frame, command=self.text_log.yview)
         scroll_log.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_log.configure(yscrollcommand=scroll_log.set)
+        
+        # 右侧：机器狗日志
+        dog_log_frame = ttk.LabelFrame(bottom_frame, text="机器狗日志")
+        dog_log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+        
+        self.text_dog_log = tk.Text(dog_log_frame, height=8, foreground="#0066cc")
+        self.text_dog_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        
+        scroll_dog_log = ttk.Scrollbar(dog_log_frame, command=self.text_dog_log.yview)
+        scroll_dog_log.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_dog_log.configure(yscrollcommand=scroll_dog_log.set)
 
     def _install_logging_handler(self) -> None:
         handler = TkLogHandler(self.text_log)
@@ -236,7 +253,10 @@ class ForwarderGUI:
                     self._reset_buttons_after_error()
                     return
 
-                logging.info("=== 机器狗监听服务已启动，可以在上方输入请求并点击“发送” ===")
+                logging.info("=== 机器狗监听服务已启动，可以在上方输入请求并点击\"发送\" ===")
+                
+                # 启动机器狗日志轮询
+                self._start_dog_log_polling()
             except Exception as e:
                 logging.error(f"启动过程中出现异常: {e}")
                 messagebox.showerror("错误", f"启动失败：{e}")
@@ -256,6 +276,9 @@ class ForwarderGUI:
 
     def on_stop(self) -> None:
         self._running = False
+        
+        # 停止机器狗日志轮询
+        self._stop_dog_log_polling()
 
         def worker():
             try:
@@ -277,6 +300,50 @@ class ForwarderGUI:
                 )
 
         threading.Thread(target=worker, daemon=True).start()
+    
+    def _start_dog_log_polling(self) -> None:
+        """启动机器狗日志轮询"""
+        self._dog_log_index = 0
+        self._poll_dog_logs()
+    
+    def _stop_dog_log_polling(self) -> None:
+        """停止机器狗日志轮询"""
+        if self._dog_log_timer:
+            self.root.after_cancel(self._dog_log_timer)
+            self._dog_log_timer = None
+    
+    def _poll_dog_logs(self) -> None:
+        """轮询机器狗日志"""
+        if not self._running or not self._forwarder:
+            return
+        
+        def fetch_logs():
+            try:
+                import requests
+                dog_ip = self._forwarder.dog_controller.dog_ip
+                http_port = self._forwarder.dog_controller.http_port
+                url = f"http://{dog_ip}:{http_port}/logs?since={self._dog_log_index}"
+                
+                response = requests.get(url, timeout=2)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("ok") and data.get("logs"):
+                        logs = data.get("logs", [])
+                        if logs:
+                            # 更新日志索引
+                            self._dog_log_index += len(logs)
+                            # 显示日志
+                            for log_entry in logs:
+                                self._append_text_safe(self.text_dog_log, log_entry + "\n")
+            except Exception as e:
+                # 静默处理错误，避免日志刷屏
+                pass
+        
+        # 在后台线程获取日志
+        threading.Thread(target=fetch_logs, daemon=True).start()
+        
+        # 每500ms轮询一次
+        self._dog_log_timer = self.root.after(500, self._poll_dog_logs)
 
     def on_send(self) -> None:
         if not self._forwarder or not self._running:
