@@ -1,0 +1,224 @@
+{
+  "version": 2,
+  "top_k_default": 6,
+  "snippet_char_budget": 1400,
+  "system_instruction": "你是机器狗控制助手。将用户中文命令转换为严格JSON，输出字段只包含 action_count 和 action_sequence。action_sequence 中每个步骤必须包含 step_id、action_type、action_name，并按需要包含 direction 和 target。不要输出解释，不要输出 markdown，不要输出额外文本。",
+  "actions": [
+    {
+      "id": "stand_down_toggle",
+      "action_type": "state_control",
+      "action_name": "stand_down_toggle",
+      "aliases": ["站起来", "起立", "站立", "站好", "立正", "站直", "趴下", "卧倒", "躺下", "趴着", "休息一下"],
+      "target_schema": {},
+      "prerequisite_state": null,
+      "note": "底层是站立/趴下切换动作，中间语义统一表示为 stand_down_toggle。"
+    },
+    {
+      "id": "zero",
+      "action_type": "state_control",
+      "action_name": "zero",
+      "aliases": ["回零", "复位", "初始化", "关节回零"],
+      "target_schema": {},
+      "prerequisite_state": null,
+      "note": "用于初始化机器人关节。"
+    },
+    {
+      "id": "emergency_stop",
+      "action_type": "safety",
+      "action_name": "emergency_stop",
+      "aliases": ["急停", "紧急停止", "马上停下", "立刻停止", "停止动作"],
+      "target_schema": {},
+      "prerequisite_state": null,
+      "note": "软急停，优先级最高。"
+    },
+    {
+      "id": "gait_slow",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["低速步态", "低速模式", "慢速行走", "慢点走"],
+      "target_schema": {"gait": "slow"},
+      "prerequisite_state": null,
+      "note": "切换到低速步态。"
+    },
+    {
+      "id": "gait_medium",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["中速步态", "中速模式", "正常速度", "正常走"],
+      "target_schema": {"gait": "medium"},
+      "prerequisite_state": null,
+      "note": "切换到中速步态。"
+    },
+    {
+      "id": "gait_fast",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["高速步态", "高速模式", "快速行走", "快点走"],
+      "target_schema": {"gait": "fast"},
+      "prerequisite_state": null,
+      "note": "切换到高速步态。"
+    },
+    {
+      "id": "crawl",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["匍匐", "匍匐前进", "爬行", "匍匐模式"],
+      "target_schema": {"gait": "crawl"},
+      "prerequisite_state": null,
+      "note": "切换到匍匐步态。"
+    },
+    {
+      "id": "grasping_obstacle",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["抓地越障", "抓地越障步态"],
+      "target_schema": {"gait": "grasping_obstacle"},
+      "prerequisite_state": null,
+      "note": "切换到抓地越障步态。"
+    },
+    {
+      "id": "general_obstacle",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["通用越障", "通用越障步态"],
+      "target_schema": {"gait": "general_obstacle"},
+      "prerequisite_state": null,
+      "note": "切换到通用越障步态。"
+    },
+    {
+      "id": "high_step",
+      "action_type": "gait_switch",
+      "action_name": "set_gait",
+      "aliases": ["高踏步", "高抬腿", "高踏步模式"],
+      "target_schema": {"gait": "high_step"},
+      "prerequisite_state": null,
+      "note": "切换到高踏步步态。"
+    },
+    {
+      "id": "move_forward_backward",
+      "action_type": "locomotion",
+      "action_name": "move",
+      "aliases": ["前进", "往前走", "向前移动", "后退", "往后退", "向后移动", "倒退"],
+      "target_schema": {"distance_m": "float", "direction": ["forward", "backward"]},
+      "prerequisite_state": null,
+      "note": "线性前后移动，方向由 direction 区分。"
+    },
+    {
+      "id": "move_left_right",
+      "action_type": "locomotion",
+      "action_name": "move",
+      "aliases": ["左移", "向左移动", "往左移动", "向左平移", "右移", "向右移动", "往右移动", "向右平移"],
+      "target_schema": {"distance_m": "float", "direction": ["left", "right"]},
+      "prerequisite_state": null,
+      "note": "横向平移，方向由 direction 区分。"
+    },
+    {
+      "id": "turn_left_right",
+      "action_type": "locomotion",
+      "action_name": "turn",
+      "aliases": ["左转", "向左转", "左转弯", "右转", "向右转", "右转弯", "原地左转", "原地右转"],
+      "target_schema": {"angle_deg": "float", "direction": ["left", "right"]},
+      "prerequisite_state": null,
+      "note": "原地转向，方向由 direction 区分。"
+    },
+    {
+      "id": "posture_pitch",
+      "action_type": "posture_adjust",
+      "action_name": "adjust_posture",
+      "aliases": ["抬头", "低头", "抬起头", "低下头", "头抬高", "头放低"],
+      "target_schema": {"axis": "pitch", "value": "float", "unit": "raw", "direction": ["up", "down"]},
+      "prerequisite_state": "standing",
+      "note": "俯仰姿态调整。"
+    },
+    {
+      "id": "posture_roll",
+      "action_type": "posture_adjust",
+      "action_name": "adjust_posture",
+      "aliases": ["左倾", "向左倾斜", "右倾", "向右倾斜", "身体左歪", "身体右歪"],
+      "target_schema": {"axis": "roll", "value": "float", "unit": "raw", "direction": ["left", "right"]},
+      "prerequisite_state": "standing",
+      "note": "横滚姿态调整。"
+    },
+    {
+      "id": "posture_yaw",
+      "action_type": "posture_adjust",
+      "action_name": "adjust_posture",
+      "aliases": ["调整偏航", "身体偏航", "姿态偏航"],
+      "target_schema": {"axis": "yaw", "value": "float", "unit": "raw", "direction": ["left", "right"]},
+      "prerequisite_state": "standing",
+      "note": "偏航姿态调整。"
+    },
+    {
+      "id": "posture_height",
+      "action_type": "posture_adjust",
+      "action_name": "adjust_posture",
+      "aliases": ["身体升高", "身体降低", "抬高身体", "降低身体", "升高", "降低"],
+      "target_schema": {"axis": "height", "value": "float", "unit": "raw", "direction": ["up", "down"]},
+      "prerequisite_state": "standing",
+      "note": "身体高度调整。"
+    },
+    {
+      "id": "twist_body",
+      "action_type": "trick",
+      "action_name": "twist_body",
+      "aliases": ["扭身体", "扭一扭", "扭动身体", "摇摆"],
+      "target_schema": {},
+      "prerequisite_state": "standing",
+      "note": "执行前需要站立状态。"
+    },
+    {
+      "id": "roll_over",
+      "action_type": "trick",
+      "action_name": "roll_over",
+      "aliases": ["翻身", "翻个身", "翻滚"],
+      "target_schema": {},
+      "prerequisite_state": "lying",
+      "note": "执行前需要趴下状态。"
+    },
+    {
+      "id": "moonwalk",
+      "action_type": "trick",
+      "action_name": "moonwalk",
+      "aliases": ["太空步", "跳太空步", "来个太空步", "moonwalk"],
+      "target_schema": {},
+      "prerequisite_state": "standing",
+      "note": "执行前需要站立状态。"
+    },
+    {
+      "id": "backflip",
+      "action_type": "trick",
+      "action_name": "backflip",
+      "aliases": ["后空翻", "后翻", "翻跟头"],
+      "target_schema": {},
+      "prerequisite_state": "lying",
+      "note": "执行前需要趴下状态。"
+    },
+    {
+      "id": "greet",
+      "action_type": "trick",
+      "action_name": "greet",
+      "aliases": ["打招呼", "招手", "挥手", "问好"],
+      "target_schema": {},
+      "prerequisite_state": "standing",
+      "note": "执行前需要站立状态。"
+    },
+    {
+      "id": "jump_forward",
+      "action_type": "trick",
+      "action_name": "jump_forward",
+      "aliases": ["向前跳", "往前跳", "前跳", "跳一下"],
+      "target_schema": {},
+      "prerequisite_state": "lying",
+      "note": "执行前需要趴下状态。"
+    },
+    {
+      "id": "twist_jump",
+      "action_type": "trick",
+      "action_name": "twist_jump",
+      "aliases": ["扭身跳", "扭跳", "跳跃扭身"],
+      "target_schema": {},
+      "prerequisite_state": "standing",
+      "note": "执行前需要站立状态。"
+    }
+  ]
+}

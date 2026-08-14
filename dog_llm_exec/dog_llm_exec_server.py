@@ -181,8 +181,9 @@ def _worker_run(task_id: str, payload: Dict[str, Any], dog_ip: str, dog_port: in
         executor = DogCommandExecutor(dog_ip, dog_port)
         try:
             res = executor.exec_actions(payload)
+            expected_len = len(payload.get("action_sequence", []))
             out = {
-                "ok": all(r.ok for r in res) and len(res) == len(payload.get("actions", [])),
+                "ok": all(r.ok for r in res) and len(res) == expected_len,
                 "results": [
                     {
                         "ok": r.ok,

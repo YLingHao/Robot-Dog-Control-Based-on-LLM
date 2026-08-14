@@ -101,12 +101,66 @@ POSTURE_CODE = {
     "posture_pitch": 0x21010130,
     "posture_roll": 0x21010131,
     "posture_yaw": 0x21010135,
+    "posture_height": 0x21010102,
 }
 MOVE_CODE = {
     "move_x": 0x21010130,
     "move_y": 0x21010131,
     "move_yaw": 0x21010135,
 }
+GAIT_CODE = {
+    0x21010300,
+    0x21010307,
+    0x21010303,
+    0x21010406,
+    0x21010402,
+    0x21010401,
+    0x21010407,
+}
+
+DEFAULT_MANUAL_MODE_CODE = 0x21010C02
+DEFAULT_MOBILE_MODE_CODE = 0x21010D06
+DEFAULT_IN_PLACE_MODE_CODE = 0x21010D05
+DEFAULT_GAIT_CODE = 0x21010300
+DEFAULT_POSTURE = {
+    "posture_pitch": 0,
+    "posture_roll": 0,
+    "posture_yaw": 0,
+    "posture_height": 0,
+}
+
+INTERMEDIATE_GAIT_MAP = {
+    "slow": 0x21010300,
+    "medium": 0x21010307,
+    "fast": 0x21010303,
+    "crawl": 0x21010406,
+    "grasping_obstacle": 0x21010402,
+    "general_obstacle": 0x21010401,
+    "high_step": 0x21010407,
+}
+INTERMEDIATE_TRICK_MAP = {
+    "greet": (0x21010507, 0, None),
+    "moonwalk": (0x2101030C, 0, None),
+    "backflip": (0x21010502, 0, None),
+    "roll_over": (0x21010205, 0, None),
+    "jump_forward": (0x2101050B, 0, None),
+    "twist_body": (0x21010204, 0, None),
+    "twist_jump": (0x2101020D, 0, None),
+}
+INTERMEDIATE_STATE_MAP = {
+    "stand_down_toggle": (0x21010202, 0, None),
+    "zero": (0x21010C05, 0, None),
+}
+INTERMEDIATE_SAFETY_MAP = {
+    "emergency_stop": (0x21020C0E, 0, None),
+}
+
+
+@dataclass
+class TaskExecutionContext:
+    restore_gait_speed: bool = False
+    restore_posture: bool = False
+    is_restoring: bool = False
 
 
 class RobotStatusWatcher:
@@ -462,12 +516,160 @@ class DogCommandExecutor:
     def _prepare_for_first_move(self) -> None:
         """准备移动动作：确保站立状态并切换到移动模式"""
         logging.info("准备移动动作：切换到手动模式并确保站立...")
-        self._perform_action(0x21010C02, 0)  # 手动模式
+        self._perform_action(DEFAULT_MANUAL_MODE_CODE, 0)
         time.sleep(0.3)
         self._ensure_state(DogState.STANDING, timeout=10.0)
-        self._perform_action(0x21010D06, 0)  # 移动模式
-        time.sleep(0.5)  # 给模式切换足够时间
+        self._perform_action(DEFAULT_MOBILE_MODE_CODE, 0)
+        time.sleep(0.5)
         self._wait_motion_stable(timeout=3.0)
+
+    def _is_posture_action(self, semantic: Optional[str], code: int) -> bool:
+        return semantic in POSTURE_CODE and POSTURE_CODE[semantic] == code
+
+    def _is_gait_action(self, code: int) -> bool:
+        return code in GAIT_CODE
+
+    def _needs_default_restore(self, actions: List[Dict[str, Any]]) -> TaskExecutionContext:
+        ctx = TaskExecutionContext()
+        for act in actions:
+            semantic = act.get("semantic")
+            try:
+                code = int(str(act.get("code")), 16)
+            except Exception:
+                continue
+            if self._is_gait_action(code):
+                ctx.restore_gait_speed = True
+            if self._is_posture_action(semantic, code):
+                ctx.restore_posture = True
+        return ctx
+
+    def _restore_default_profile(self, ctx: TaskExecutionContext) -> None:
+        if not (ctx.restore_gait_speed or ctx.restore_posture):
+            return
+
+        logging.info("开始恢复默认速度、步态和姿态配置...")
+        ctx.is_restoring = True
+        try:
+            self._send_stop_motion(duration=1.0)
+            self._ensure_state(DogState.STANDING, timeout=10.0)
+
+            if ctx.restore_posture:
+                self._perform_action(DEFAULT_IN_PLACE_MODE_CODE, 0)
+                time.sleep(0.3)
+                for semantic, value in DEFAULT_POSTURE.items():
+                    self._perform_action(POSTURE_CODE[semantic], int(value))
+                    time.sleep(0.2)
+                self._wait_motion_stable(timeout=2.0)
+
+            if ctx.restore_gait_speed:
+                self._perform_action(DEFAULT_MANUAL_MODE_CODE, 0)
+                time.sleep(0.2)
+                self._perform_action(DEFAULT_MOBILE_MODE_CODE, 0)
+                time.sleep(0.3)
+                self._perform_action(DEFAULT_GAIT_CODE, 0)
+                self._wait_motion_stable(timeout=3.0)
+
+            logging.info("默认速度、步态和姿态恢复完成")
+        except Exception as e:
+            logging.warning(f"恢复默认配置时出现异常: {e}")
+        finally:
+            ctx.is_restoring = False
+
+    def _compile_intermediate_step(self, step: Dict[str, Any]) -> Dict[str, Any]:
+        action_type = step.get("action_type")
+        action_name = step.get("action_name")
+        direction = step.get("direction")
+        target = step.get("target", {}) or {}
+
+        if action_type == "locomotion":
+            if action_name == "move":
+                distance = float(target.get("distance_m", 0))
+                if direction == "forward":
+                    return {"code": "0x21010130", "param": distance, "semantic": "move_x"}
+                if direction == "backward":
+                    return {"code": "0x21010130", "param": -distance, "semantic": "move_x"}
+                if direction == "right":
+                    return {"code": "0x21010131", "param": distance, "semantic": "move_y"}
+                if direction == "left":
+                    return {"code": "0x21010131", "param": -distance, "semantic": "move_y"}
+                raise ValueError(f"未知 move direction: {direction}")
+            if action_name == "turn":
+                angle = float(target.get("angle_deg", 0))
+                if direction == "right":
+                    return {"code": "0x21010135", "param": angle, "semantic": "move_yaw"}
+                if direction == "left":
+                    return {"code": "0x21010135", "param": -angle, "semantic": "move_yaw"}
+                raise ValueError(f"未知 turn direction: {direction}")
+            raise ValueError(f"未知 locomotion action_name: {action_name}")
+
+        if action_type == "gait_switch":
+            gait = target.get("gait")
+            if gait not in INTERMEDIATE_GAIT_MAP:
+                raise ValueError(f"未知 gait: {gait}")
+            return {"code": hex(INTERMEDIATE_GAIT_MAP[gait])}
+
+        if action_type == "posture_adjust":
+            axis = target.get("axis")
+            value = float(target.get("value", 0))
+            if axis == "pitch":
+                param = value if direction == "down" else -value
+                return {"code": "0x21010130", "param": param, "semantic": "posture_pitch"}
+            if axis == "height":
+                param = value if direction == "up" else -value
+                return {"code": "0x21010102", "param": param, "semantic": "posture_height"}
+            if axis == "roll":
+                param = value if direction == "right" else -value
+                return {"code": "0x21010131", "param": param, "semantic": "posture_roll"}
+            if axis == "yaw":
+                param = value if direction == "right" else -value
+                return {"code": "0x21010135", "param": param, "semantic": "posture_yaw"}
+            raise ValueError(f"未知 posture axis: {axis}")
+
+        if action_type == "trick":
+            if action_name not in INTERMEDIATE_TRICK_MAP:
+                raise ValueError(f"未知 trick: {action_name}")
+            code, param, semantic = INTERMEDIATE_TRICK_MAP[action_name]
+            payload = {"code": hex(code)}
+            if param is not None:
+                payload["param"] = param
+            if semantic is not None:
+                payload["semantic"] = semantic
+            return payload
+
+        if action_type == "state_control":
+            if action_name not in INTERMEDIATE_STATE_MAP:
+                raise ValueError(f"未知 state_control: {action_name}")
+            code, param, semantic = INTERMEDIATE_STATE_MAP[action_name]
+            payload = {"code": hex(code)}
+            if param is not None:
+                payload["param"] = param
+            if semantic is not None:
+                payload["semantic"] = semantic
+            return payload
+
+        if action_type == "safety":
+            if action_name not in INTERMEDIATE_SAFETY_MAP:
+                raise ValueError(f"未知 safety action: {action_name}")
+            code, param, semantic = INTERMEDIATE_SAFETY_MAP[action_name]
+            payload = {"code": hex(code)}
+            if param is not None:
+                payload["param"] = param
+            if semantic is not None:
+                payload["semantic"] = semantic
+            return payload
+
+        raise ValueError(f"未知 action_type: {action_type}")
+
+    def _normalize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(payload, dict) and "actions" in payload:
+            return payload
+        if isinstance(payload, dict) and "action_sequence" in payload:
+            sequence = payload.get("action_sequence", [])
+            if not isinstance(sequence, list) or not sequence:
+                raise ValueError("中间语义JSON中必须包含非空 action_sequence")
+            compiled_actions = [self._compile_intermediate_step(step) for step in sequence]
+            return {"actions": compiled_actions}
+        raise ValueError("不支持的任务JSON格式，缺少 actions 或 action_sequence")
 
     def _exec_moonwalk(self) -> None:
         """太空步 0x2101030C 的专用执行逻辑，直接按 gesture_main.py 的实现移植。
@@ -553,37 +755,46 @@ class DogCommandExecutor:
 
         # 移动动作：参考precise_control_main的设计，每个动作后都有停顿
         if semantic in MOVE_CODE and MOVE_CODE[semantic] == code:
-            # 确保在移动模式
-            self._perform_action(0x21010D06, 0)
+            self._perform_action(DEFAULT_MOBILE_MODE_CODE, 0)
             time.sleep(0.2)
-            
-            if semantic == "move_x": 
+
+            if semantic == "move_x":
                 times, val = go_straight(param, 3)
-            elif semantic == "move_y": 
+            elif semantic == "move_y":
                 times, val = translate_left_and_right(param, 3)
-            elif semantic == "move_yaw": 
+            elif semantic == "move_yaw":
                 times, val = revolve_left_and_right(param)
-            else: 
+            else:
                 raise ValueError("未知移动语义")
-            
-            # 执行移动动作（带避障检测）
+
             self._run_repeat_action_with_obstacle_check(code, times, val, semantic, param)
-            # 完全停止（参考precise_control_main的1秒停顿）
             self._send_stop_motion()
             return
 
-        # 姿态调整：必须在原地模式，且确保站立状态（抬头低头不能在趴下时执行）
-        if semantic in POSTURE_CODE and POSTURE_CODE[semantic] == code:
-            # 抬头低头需要站立状态
-            if semantic == "posture_pitch":
+        if self._is_gait_action(code):
+            logging.info(f"执行步态/速度切换动作: {hex(code)}")
+            self._ensure_state(DogState.STANDING, timeout=8.0)
+            self._perform_action(DEFAULT_MANUAL_MODE_CODE, 0)
+            time.sleep(0.2)
+            self._perform_action(DEFAULT_MOBILE_MODE_CODE, 0)
+            time.sleep(0.3)
+            self._perform_action(code, 0)
+            self._wait_motion_stable(timeout=3.0)
+            time.sleep(0.5)
+            return
+
+        # 姿态调整：必须在原地模式，且确保站立状态
+        if self._is_posture_action(semantic, code):
+            if semantic in {"posture_pitch", "posture_height", "posture_roll", "posture_yaw"}:
                 if self._cur_state != DogState.STANDING:
-                    logging.warning(f"抬头低头需要站立状态，当前: {self._cur_state}，先切换到站立...")
+                    logging.warning(f"姿态调整需要站立状态，当前: {self._cur_state}，先切换到站立...")
                     self._ensure_state(DogState.STANDING, timeout=8.0)
-            
-            self._perform_action(0x21010D05, 0)  # 原地模式
+
+            self._perform_action(DEFAULT_IN_PLACE_MODE_CODE, 0)
             time.sleep(0.3)
             self._perform_action(code, int(param))
-            time.sleep(0.8)  # 给姿态调整足够时间
+            time.sleep(0.8)
+            self._wait_motion_stable(timeout=2.0)
             return
 
         # 特技动作：参考gesture_main.py的状态监听设计，但需要等待完成（连续动作）
@@ -639,79 +850,80 @@ class DogCommandExecutor:
         time.sleep(0.5)
 
     def exec_actions(self, payload: Dict[str, Any]) -> List[ExecResult]:
+        payload = self._normalize_payload(payload)
         actions = payload.get("actions", [])
-        if not actions: raise ValueError("JSON中必须包含非空 actions 数组")
+        if not actions:
+            raise ValueError("JSON中必须包含非空 actions 数组")
 
+        ctx = self._needs_default_restore(actions)
         has_move = self._has_move(actions)
         if has_move:
             self._prepare_for_first_move()
         else:
-            # 纯特技动作也需要站立状态
             self._wait_motion_stable(timeout=6.0)
             self._ensure_state(DogState.STANDING, timeout=10.0)
 
         results: List[ExecResult] = []
-        for idx, act in enumerate(actions):
-            started = time.time()
-            code_raw, param, semantic = act.get("code"), act.get("param", 0), act.get("semantic")
-            try:
-                code = int(str(code_raw), 16)
-            except Exception as e:
-                results.append(ExecResult(False, idx, 0, param, f"code解析失败: {e}", started, time.time())); break
-
-            if code == 0x21020C0E:
+        try:
+            for idx, act in enumerate(actions):
+                started = time.time()
+                code_raw, param, semantic = act.get("code"), act.get("param", 0), act.get("semantic")
                 try:
-                    self.emergency_stop()
-                    results.append(ExecResult(True, idx, code, param, "已急停", started, time.time()))
+                    code = int(str(code_raw), 16)
                 except Exception as e:
-                    results.append(ExecResult(False, idx, code, param, f"急停失败: {e}", started, time.time()))
-                break
+                    results.append(ExecResult(False, idx, 0, param, f"code解析失败: {e}", started, time.time()))
+                    break
 
-            try:
-                logging.info(f"==> [动作 {idx+1}/{len(actions)}] 开始: {hex(code)}")
-                self._exec_motion(code, float(param or 0), semantic)
-                results.append(ExecResult(True, idx, code, param, "执行成功", started, time.time()))
-
-                # 动作之间的准备：参考precise_control_main的1秒停顿
-                is_last_action = idx == len(actions) - 1
-                if not is_last_action:
+                if code == 0x21020C0E:
                     try:
-                        # 移动动作之间：已经通过_send_stop_motion处理了停顿
-                        # 特技动作之间：需要准备下一个动作的状态
-                        next_code = int(str(actions[idx + 1].get("code")), 16)
-                        next_semantic = actions[idx + 1].get("semantic")
-                        
-                        # 如果下一个是移动动作，确保在移动模式
-                        if next_semantic in MOVE_CODE:
-                            self._perform_action(0x21010D06, 0)
-                            time.sleep(0.3)
-                        # 如果下一个是特技动作，准备状态
-                        elif next_code in PREREQUISITE_STATE:
-                            target_state = PREREQUISITE_STATE[next_code]
-                            # 先刷新状态，避免基于错误状态做判断
-                            self._refresh_state(timeout=1.0)
-                            self._wait_motion_stable(timeout=3.0)  # 缩短超时时间，避免阻塞
-                            logging.info(f"为下一个动作 {hex(next_code)} 准备，恢复到状态: {target_state}")
-                            self._ensure_state(target_state, timeout=10.0)
-                        # 其他情况：简单等待稳定
-                        else:
-                            self._wait_motion_stable(timeout=2.0)
-                            time.sleep(0.5)  # 参考precise_control_main的停顿
+                        self.emergency_stop()
+                        results.append(ExecResult(True, idx, code, param, "已急停", started, time.time()))
                     except Exception as e:
-                        logging.warning(f"动作间准备过程异常: {e}，继续执行下一个动作...")
-                        time.sleep(0.5)  # 至少等待一小段时间
+                        results.append(ExecResult(False, idx, code, param, f"急停失败: {e}", started, time.time()))
+                    break
 
-            except Exception as e:
-                logging.error(f"[动作 {idx+1}] 异常: {e}")
-                try: self.emergency_stop()
-                except: pass
-                results.append(ExecResult(False, idx, code, param, f"执行异常: {e}", started, time.time()))
-                return results
+                try:
+                    logging.info(f"==> [动作 {idx+1}/{len(actions)}] 开始: {hex(code)}")
+                    self._exec_motion(code, float(param or 0), semantic)
+                    results.append(ExecResult(True, idx, code, param, "执行成功", started, time.time()))
 
-        if has_move:
-            self._send_stop_motion(duration=1.2)
+                    is_last_action = idx == len(actions) - 1
+                    if not is_last_action:
+                        try:
+                            next_code = int(str(actions[idx + 1].get("code")), 16)
+                            next_semantic = actions[idx + 1].get("semantic")
 
-        return results
+                            if next_semantic in MOVE_CODE or next_code in GAIT_CODE:
+                                self._perform_action(DEFAULT_MOBILE_MODE_CODE, 0)
+                                time.sleep(0.3)
+                            elif next_code in PREREQUISITE_STATE:
+                                target_state = PREREQUISITE_STATE[next_code]
+                                self._refresh_state(timeout=1.0)
+                                self._wait_motion_stable(timeout=3.0)
+                                logging.info(f"为下一个动作 {hex(next_code)} 准备，恢复到状态: {target_state}")
+                                self._ensure_state(target_state, timeout=10.0)
+                            else:
+                                self._wait_motion_stable(timeout=2.0)
+                                time.sleep(0.5)
+                        except Exception as e:
+                            logging.warning(f"动作间准备过程异常: {e}，继续执行下一个动作...")
+                            time.sleep(0.5)
+
+                except Exception as e:
+                    logging.error(f"[动作 {idx+1}] 异常: {e}")
+                    try:
+                        self.emergency_stop()
+                    except Exception:
+                        pass
+                    results.append(ExecResult(False, idx, code, param, f"执行异常: {e}", started, time.time()))
+                    return results
+
+            if has_move:
+                self._send_stop_motion(duration=1.2)
+
+            return results
+        finally:
+            self._restore_default_profile(ctx)
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser()

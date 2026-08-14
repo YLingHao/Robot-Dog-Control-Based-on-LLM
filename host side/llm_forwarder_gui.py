@@ -16,18 +16,21 @@
 - 「终止」按钮：停止狗端监听服务，但不关闭本界面，可再次点击「启动」重新连接。
 """
 
+import csv
 import logging
 import queue
 import threading
 import time
 import os
 import tempfile
+from datetime import datetime
 from typing import Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from llm_forwarder import LLMForwarder, JSONExtractor
+from action_kb import build_augmented_prompt
+from llm_forwarder import LLMForwarder, JSONExtractor, JSONPipeline
 
 
 class TkLogHandler(logging.Handler):
@@ -72,9 +75,12 @@ class ForwarderGUI:
         self._wake_listening = False        # 是否正在监听唤醒词
         self._wake_thread = None            # 唤醒词监听线程
 
-        # 上下文记忆：保存历史对话（最多保留 8K tokens）
-        self._conversation_history = []     # 历史对话列表，格式: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-        self._max_context_tokens = 8000     # 最大上下文长度（tokens）
+        # 延迟测试相关状态
+        self._latency_measure_active = False
+        self._latency_t0 = None
+        self._latency_marks = {}
+        self._latency_meta = {}
+        self._latency_csv_path = os.path.abspath("latency_results_gui.csv")
 
         # UI 组件
         self._build_widgets()
@@ -93,10 +99,12 @@ class ForwarderGUI:
         # 行 1：狗 IP + 密码
         ttk.Label(cfg_frame, text="机器狗 IP:").grid(row=0, column=0, sticky="e", padx=4, pady=3)
         self.entry_dog_ip = ttk.Entry(cfg_frame, width=18)
+        self.entry_dog_ip.insert(0, "192.168.1.100")
         self.entry_dog_ip.grid(row=0, column=1, sticky="w", padx=4, pady=3)
 
         ttk.Label(cfg_frame, text="SSH 密码(可空):").grid(row=0, column=2, sticky="e", padx=4, pady=3)
         self.entry_password = ttk.Entry(cfg_frame, width=18, show="*")
+        self.entry_password.insert(0, "1")
         self.entry_password.grid(row=0, column=3, sticky="w", padx=4, pady=3)
 
         # 行 2：Ollama URL + 模型
@@ -112,12 +120,14 @@ class ForwarderGUI:
             values=[
                 "qwen3-dog",
                 "qwen3:4b",
+                "qwen3:4b-instruct",
+                "qwen3-4b-instruct-new",
                 "qwen2.5:7b",
                 "llama3:8b",
                 "deepseek-r1:7b",
             ],
         )
-        self.combo_model.set("qwen3-dog")
+        self.combo_model.set("qwen3-4b-instruct-new")
         self.combo_model.grid(row=1, column=3, sticky="w", padx=4, pady=3)
 
         # 行 3：按钮
@@ -130,8 +140,19 @@ class ForwarderGUI:
         self.btn_stop = ttk.Button(btn_frame, text="终止", width=10, command=self.on_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
+        self.btn_emergency = ttk.Button(btn_frame, text="急停", width=10, command=self.on_emergency_stop, state=tk.DISABLED)
+        self.btn_emergency.pack(side=tk.LEFT, padx=4)
+
         self.btn_clear_history = ttk.Button(btn_frame, text="清空历史", width=10, command=self.on_clear_history)
         self.btn_clear_history.pack(side=tk.LEFT, padx=4)
+
+        self.test_mode_var = tk.BooleanVar(value=False)
+        self.chk_test_mode = ttk.Checkbutton(btn_frame, text="测试模式", variable=self.test_mode_var)
+        self.chk_test_mode.pack(side=tk.LEFT, padx=4)
+
+        self.latency_test_var = tk.BooleanVar(value=False)
+        self.chk_latency_test = ttk.Checkbutton(btn_frame, text="延迟测试", variable=self.latency_test_var)
+        self.chk_latency_test.pack(side=tk.LEFT, padx=4)
 
         # 中部：对话与输出
         mid_frame = ttk.Frame(self.root)
@@ -246,7 +267,7 @@ class ForwarderGUI:
             return
 
         ollama_url = self.entry_ollama.get().strip() or "http://localhost:11434"
-        model = self.combo_model.get().strip() or "qwen3:4b"
+        model = self.combo_model.get().strip() or "qwen3-4b-instruct-new"
         user_pwd = self.entry_password.get().strip()
 
         # 构造密码列表：如果用户填了，就优先用用户密码
@@ -255,16 +276,20 @@ class ForwarderGUI:
         else:
             passwords = ["1", "root"]
 
-        # 禁用启动按钮，启用终止和发送
+        test_mode = self.test_mode_var.get()
+
+        # 禁用启动按钮，启用终止、急停和发送
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
+        self.btn_emergency.config(state=tk.NORMAL)
         self.btn_send.config(state=tk.NORMAL)
 
         self._running = True
 
         def worker():
             try:
-                logging.info("=== 正在创建转发器并连接机器狗 ===")
+                mode_text = "测试模式" if test_mode else "机器狗连接模式"
+                logging.info(f"=== 正在创建转发器（{mode_text}） ===")
                 forwarder = LLMForwarder(
                     dog_ip=dog_ip,
                     dog_user="root",
@@ -278,6 +303,10 @@ class ForwarderGUI:
                 )
                 self._forwarder = forwarder
 
+                if test_mode:
+                    logging.info("=== 已进入测试模式：不连接机器狗，仅测试主机端解析与界面功能 ===")
+                    return
+
                 # 仅启动狗端监听服务，不进入命令行交互循环
                 ok = forwarder.dog_controller.start_server()
                 if not ok:
@@ -289,7 +318,7 @@ class ForwarderGUI:
                     return
 
                 logging.info("=== 机器狗监听服务已启动，可以在上方输入请求并点击\"发送\" ===")
-                
+
                 # 启动机器狗日志轮询
                 self._start_dog_log_polling()
             except Exception as e:
@@ -305,21 +334,23 @@ class ForwarderGUI:
         def _reset():
             self.btn_start.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
+            self.btn_emergency.config(state=tk.DISABLED)
             self.btn_send.config(state=tk.DISABLED)
 
         self.root.after(0, _reset)
 
     def on_clear_history(self) -> None:
-        """清空对话历史"""
-        self._conversation_history.clear()
-        logging.info("已清空对话历史，上下文记忆已重置")
-        messagebox.showinfo("提示", "对话历史已清空，下次对话将重新开始。")
+        """清空当前显示内容"""
+        self.text_request.delete("1.0", tk.END)
+        self.text_model_output.delete("1.0", tk.END)
+        self.text_think.delete("1.0", tk.END)
+        self.text_final.delete("1.0", tk.END)
+        logging.info("已清空当前输入和输出显示")
+        messagebox.showinfo("提示", "当前输入和输出已清空。")
 
     def on_stop(self) -> None:
-        # 停止时顺便清空上下文，避免下次启动时「记忆错乱」
         self._running = False
-        self._conversation_history.clear()
-        logging.info("已停止监听服务并清空对话历史（上下文已重置）")
+        logging.info("已停止监听服务")
 
         # 停止机器狗日志轮询
         self._stop_dog_log_polling()
@@ -327,21 +358,53 @@ class ForwarderGUI:
         def worker():
             try:
                 if self._forwarder is not None:
-                    logging.info("=== 正在停止机器狗监听服务 ===")
-                    try:
-                        self._forwarder.dog_controller.stop_server()
-                    finally:
+                    if self.test_mode_var.get():
+                        logging.info("=== 正在退出测试模式 ===")
                         self._forwarder = None
-                    logging.info("=== 监听服务已停止，界面仍可再次启动 ===")
+                        logging.info("=== 测试模式已停止，界面仍可再次启动 ===")
+                    else:
+                        logging.info("=== 正在停止机器狗监听服务 ===")
+                        try:
+                            self._forwarder.dog_controller.stop_server()
+                        finally:
+                            self._forwarder = None
+                        logging.info("=== 监听服务已停止，界面仍可再次启动 ===")
             finally:
                 self.root.after(
                     0,
                     lambda: (
                         self.btn_start.config(state=tk.NORMAL),
                         self.btn_stop.config(state=tk.DISABLED),
+                        self.btn_emergency.config(state=tk.DISABLED),
                         self.btn_send.config(state=tk.DISABLED),
                     ),
                 )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_emergency_stop(self) -> None:
+        if not self._forwarder or not self._running:
+            messagebox.showwarning("提示", "请先启动并连接机器狗。")
+            return
+
+        if self.test_mode_var.get():
+            logging.warning("测试模式下不会向机器狗发送急停命令。")
+            messagebox.showinfo("提示", "测试模式下不会发送急停命令。")
+            return
+
+        self.btn_emergency.config(state=tk.DISABLED)
+
+        def worker():
+            try:
+                logging.warning("=== 正在执行急停：当前动作与后续队列将被取消 ===")
+                ok, result = self._forwarder.dog_controller.emergency_stop()
+                if ok:
+                    logging.warning("✓ 急停命令已发送，机器狗当前动作和后续动作已被终止。")
+                else:
+                    err = result.get("error") if result else "未知错误"
+                    logging.error(f"✗ 急停失败: {err}")
+            finally:
+                self.root.after(0, lambda: self.btn_emergency.config(state=tk.NORMAL if self._running else tk.DISABLED))
 
         threading.Thread(target=worker, daemon=True).start()
     
@@ -624,6 +687,9 @@ class ForwarderGUI:
                     )
                     return
 
+                if self.latency_test_var.get():
+                    self._latency_start(mode="audio")
+
                 logging.info("录音结束，正在保存临时音频文件并调用 Whisper 转文本...")
 
                 tmp_path = None
@@ -675,6 +741,9 @@ class ForwarderGUI:
                         return
 
                     logging.info(f"Whisper 识别结果: {text}")
+                    if self._latency_measure_active:
+                        self._latency_meta["asr_text"] = text
+                        self._latency_mark("asr_done")
 
                     def update_input_and_maybe_send():
                         # 将识别结果填入输入框（覆盖原内容）
@@ -716,7 +785,12 @@ class ForwarderGUI:
             messagebox.showwarning("提示", "请先启动并连接机器狗。")
             return
 
+        if self.latency_test_var.get() and not self._latency_measure_active:
+            self._latency_start(mode="text")
+
         prompt = self.text_request.get("1.0", tk.END).strip()
+        if self._latency_measure_active:
+            self._latency_meta["input_text"] = prompt
         if not prompt:
             messagebox.showwarning("提示", "请输入要发送给大模型的内容。")
             return
@@ -730,118 +804,114 @@ class ForwarderGUI:
 
         def worker():
             try:
-                logging.info("开始调用大模型（流式输出，包含上下文记忆）...")
+                logging.info("开始调用大模型（流式输出，单轮解析）...")
+                if self._latency_measure_active:
+                    self._latency_mark("llm_start")
                 full_text = self._call_ollama_stream_gui(prompt)
+                if self._latency_measure_active:
+                    self._latency_mark("llm_done")
 
                 if not full_text:
                     logging.warning("大模型未返回任何内容。")
                 else:
-                    # 保存对话历史：添加用户输入和助手回复
-                    self._conversation_history.append({"role": "user", "content": prompt})
-                    self._conversation_history.append({"role": "assistant", "content": full_text})
-                    logging.debug(f"已保存对话历史，当前历史记录数: {len(self._conversation_history) // 2} 轮")
-                    
                     # full_text 已经是过滤掉 think 后的纯 response 内容
                     # 直接显示到最终输出区域
                     self._append_text_safe(self.text_final, full_text + "\n")
 
                     # 从最终文本中提取 JSON 指令并转发
                     logging.debug(f"用于JSON提取的文本: {full_text}")
-                    json_data = JSONExtractor.extract_json(full_text)
-                    if json_data and JSONExtractor.validate_command(json_data):
-                        logging.info("从大模型输出中检测到 JSON 指令，正在转发到机器狗...")
-                        ok, result = self._forwarder.dog_controller.send_command(json_data)
-                        if ok:
-                            task_id = result.get("task_id") if result else None
-                            logging.info(f"✓ 指令已发送到机器狗，任务ID: {task_id}")
+                    if self._latency_measure_active:
+                        self._latency_mark("json_start")
+                    json_data, post_fixes, (json_valid, json_reason) = JSONPipeline.extract_repair_and_validate(
+                        full_text,
+                        prompt,
+                    )
+                    if post_fixes:
+                        logging.info(f"JSON 后修复: {post_fixes}")
+                    if self._latency_measure_active:
+                        self._latency_mark("json_done")
+                    if json_data and json_valid:
+                        logging.info(f"JSON 校验通过，原因: {json_reason}")
+                        if self.test_mode_var.get():
+                            logging.info("测试模式下检测到有效 JSON 指令，已跳过机器狗发送。")
+                            logging.info(f"测试模式 JSON: {json_data}")
+                            if self._latency_measure_active:
+                                self._latency_log_summary(None)
                         else:
-                            err = result.get("error") if result else "未知错误"
-                            logging.error(f"✗ 指令发送失败: {err}")
+                            logging.info("从大模型输出中检测到 JSON 指令，正在转发到机器狗...")
+                            if self._latency_measure_active:
+                                self._latency_mark("submit_start")
+                            ok, result = self._forwarder.dog_controller.send_command(json_data)
+                            if self._latency_measure_active:
+                                self._latency_mark("submit_done")
+                            if ok:
+                                task_id = result.get("task_id") if result else None
+                                if self._latency_measure_active:
+                                    self._latency_meta["task_id"] = task_id or ""
+                                logging.info(f"✓ 指令已发送到机器狗，任务ID: {task_id}")
+                                if self._latency_measure_active and task_id:
+                                    threading.Thread(
+                                        target=self._poll_task_result_for_latency,
+                                        args=(task_id,),
+                                        daemon=True
+                                    ).start()
+                            else:
+                                err = result.get("error") if result else "未知错误"
+                                if self._latency_measure_active:
+                                    self._latency_meta["error"] = err
+                                logging.error(f"✗ 指令发送失败: {err}")
+                                if self._latency_measure_active:
+                                    self._latency_log_summary(None)
                     else:
-                        logging.info("本次大模型输出中未检测到有效的 JSON 指令。")
+                        preview = full_text[:300].replace("\n", "\\n")
+                        logging.info(f"本次大模型输出中未检测到有效的 JSON 指令，原因: {json_reason}。")
+                        logging.info(f"模型输出摘要: {preview}")
+                        if json_data:
+                            logging.info(f"提取后的候选 JSON: {json_data}")
+                        if self._latency_measure_active:
+                            self._latency_meta["json_reason"] = json_reason
+                            self._latency_log_summary(None)
             finally:
                 self.root.after(0, lambda: self.btn_send.config(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # 上下文记忆管理
-    # ------------------------------------------------------------------
-    def _estimate_tokens(self, text: str) -> int:
-        """简单估算文本的 token 数量（中文字符 * 1.5，英文单词 * 1.3）"""
-        # 中文字符数（包括中文标点）
-        chinese_chars = len([c for c in text if '\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u303f' or '\uff00' <= c <= '\uffef'])
-        # 英文单词数（简单按空格分割）
-        english_words = len(text.split()) - chinese_chars
-        # 估算 tokens（中文字符 * 1.5，英文单词 * 1.3）
-        estimated_tokens = int(chinese_chars * 1.5 + english_words * 1.3)
-        return max(estimated_tokens, len(text) // 4)  # 至少按字符数的 1/4 估算
-    
-    def _trim_conversation_history(self, new_user_message: str) -> None:
-        """修剪对话历史，确保不超过最大上下文长度"""
-        # 估算新消息的 tokens
-        new_tokens = self._estimate_tokens(new_user_message)
-        
-        # 计算当前历史的总 tokens
-        total_tokens = new_tokens
-        for msg in self._conversation_history:
-            total_tokens += self._estimate_tokens(msg.get("content", ""))
-        
-        # 如果超过限制，从最旧的对话开始删除
-        while total_tokens > self._max_context_tokens and len(self._conversation_history) > 0:
-            removed_msg = self._conversation_history.pop(0)
-            total_tokens -= self._estimate_tokens(removed_msg.get("content", ""))
-    
-    # ------------------------------------------------------------------
-    # 大模型调用（GUI 版流式输出，带上下文记忆）
+    # 大模型调用（GUI 版流式输出，单轮解析）
     # ------------------------------------------------------------------
     def _call_ollama_stream_gui(self, prompt: str) -> str:
         """
         参照 LLMForwarder.call_ollama_api 的流式实现，但输出到 GUI。
-        使用 /api/generate 接口，并通过构造带历史对话的 prompt 来实现上下文记忆。
-        这样可以保持之前对 deepseek 等模型的 thinking 字段兼容。
+        使用 /api/generate 接口进行单轮解析，并在请求前注入本地动作知识库。
         """
         import requests
         import json
 
-        # 修剪对话历史，确保不超过最大上下文长度
-        self._trim_conversation_history(prompt)
-
-        # 将历史对话 + 当前用户输入拼接成一个大的 prompt
-        context_prompt = ""
-        for msg in self._conversation_history:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if not content:
-                continue
-            if role == "user":
-                context_prompt += f"用户: {content}\n\n"
-            # 不拼入历史assistant输出，避免模型重复生成相同JSON指令
-            else:
-                continue
-
-        context_prompt += (
-            "Below is an instruction that describes a task, paired with an input that provides further context. "
-            "Write a response that appropriately completes the request.\n\n"
-            "### Instruction:\n"
-            "你是一个机器狗控制助手，将用户的自然语言命令转换为JSON格式的控制指令。\n\n"
-            f"### Input:\n{prompt}\n\n"
-            "### Response:\n"
+        context_prompt, kb_debug = build_augmented_prompt(prompt)
+        logging.info(
+            "构造单轮聊天请求: retrieve_ms=%sms%s",
+            kb_debug.get("retrieve_ms", 0),
+            " (fallback)" if kb_debug.get("used_fallback") else "",
         )
 
-        api_url = f"{self._forwarder._ollama_url}/api/generate"
+        api_url = f"{self._forwarder._ollama_url}/api/chat"
         
         # 根据思考模式开关设置参数（默认不启用思考模式）
         enable_thinking = False
         payload = {
             "model": self._forwarder._model,
-            "prompt": context_prompt,
+            "messages": [
+                {"role": "system", "content": kb_debug.get("system_instruction", "")},
+                {"role": "user", "content": prompt}
+            ],
             "stream": True,
         }
 
-        # 关闭思考模式
         payload["options"] = {
-            "Think": False
+            "Think": False,
+            "temperature": 0.95,
+            "top_p": 0.7,
+            "num_predict": 512
         }
 
         try:
@@ -892,21 +962,19 @@ class ForwarderGUI:
                         self._append_text_safe(self.text_model_output, thinking_chunk)
                         thinking_displayed_to_model = True
 
-                # /api/generate 接口返回的是 response 字段
-                # 注意：同一个 chunk 可能同时包含 thinking 和 response
                 response_chunk = None
-                if "response" in data:
+                message = data.get("message")
+                if isinstance(message, dict):
+                    response_chunk = message.get("content")
+                if response_chunk is None and "response" in data:
                     response_chunk = data["response"]
-                    # response 可能是空字符串，但我们需要处理它（累积到 full_response）
-                    if response_chunk is not None:  # 允许空字符串，但不允许 None
-                        # 如果之前有think内容但还没显示到模型输出窗口，先显示
-                        if full_thinking and not thinking_displayed_to_model:
-                            self._append_text_safe(self.text_model_output, full_thinking)
-                            thinking_displayed_to_model = True
-                        
-                        full_response += response_chunk
-                        # 实时显示response到模型输出区域（紧跟在thinking后面）
-                        self._append_text_safe(self.text_model_output, response_chunk)
+                if response_chunk is not None:
+                    if full_thinking and not thinking_displayed_to_model:
+                        self._append_text_safe(self.text_model_output, full_thinking)
+                        thinking_displayed_to_model = True
+
+                    full_response += response_chunk
+                    self._append_text_safe(self.text_model_output, response_chunk)
 
                 if data.get("done", False):
                     # 如果结束时还有think内容但没显示到模型输出窗口，显示它
@@ -933,7 +1001,6 @@ class ForwarderGUI:
         
         # 返回完整文本（用于后续JSON提取）
         # 注意：最终输出窗口应该只包含 response，不包含 thinking
-        # 所以返回时只返回 full_response，不包含 think 标记
         return full_response
 
     # ------------------------------------------------------------------
@@ -1009,6 +1076,171 @@ class ForwarderGUI:
         return think_text, filtered
 
     # ------------------------------------------------------------------
+    def _latency_reset(self) -> None:
+        self._latency_measure_active = False
+        self._latency_t0 = None
+        self._latency_marks = {}
+        self._latency_meta = {}
+
+    def _latency_start(self, mode: str = "text") -> None:
+        self._latency_measure_active = True
+        self._latency_t0 = time.perf_counter()
+        self._latency_marks = {"t0": self._latency_t0}
+        self._latency_meta = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": mode,
+            "input_text": "",
+            "asr_text": "",
+            "task_id": "",
+            "task_status": "",
+            "error": "",
+        }
+
+    def _latency_mark(self, name: str) -> None:
+        if self._latency_measure_active:
+            self._latency_marks[name] = time.perf_counter()
+
+    def _latency_ms(self, start_key: str, end_key: str) -> float:
+        if start_key in self._latency_marks and end_key in self._latency_marks:
+            return round((self._latency_marks[end_key] - self._latency_marks[start_key]) * 1000.0, 2)
+        return -1.0
+
+    def _write_latency_csv(self, row: dict) -> None:
+        fieldnames = [
+            "timestamp",
+            "mode",
+            "input_text",
+            "asr_text",
+            "task_id",
+            "task_status",
+            "asr_latency_ms",
+            "llm_latency_ms",
+            "json_latency_ms",
+            "http_submit_latency_ms",
+            "host_total_ms",
+            "end_to_end_response_ms",
+            "server_queue_wait_ms",
+            "server_exec_ms",
+            "server_total_ms",
+            "task_total_ms",
+            "error",
+        ]
+        file_exists = os.path.exists(self._latency_csv_path)
+        with open(self._latency_csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _latency_log_summary(self, task_info: dict | None = None) -> None:
+        if not self._latency_measure_active:
+            return
+
+        self._latency_mark("done")
+
+        asr_ms = self._latency_ms("t0", "asr_done")
+        llm_ms = self._latency_ms("llm_start", "llm_done")
+        json_ms = self._latency_ms("json_start", "json_done")
+        submit_ms = self._latency_ms("submit_start", "submit_done")
+        # 主机侧总耗时：只统计到“提交完成”为止，不包含机器狗端等待与执行时间
+        host_total_ms = self._latency_ms("t0", "submit_done") if "submit_done" in self._latency_marks else self._latency_ms("t0", "json_done")
+        # 任务总时长：从开始计时到动作执行完毕
+        task_total_ms = self._latency_ms("t0", "done")
+
+        queue_wait_ms = None
+        exec_ms = None
+        server_total_ms = None
+        end_to_end_response_ms = None
+        task_status = ""
+        task_id = self._latency_meta.get("task_id", "")
+        error = self._latency_meta.get("error", "")
+
+        logging.info("=== 延迟测试结果 ===")
+        if asr_ms >= 0:
+            logging.info(f"语音识别延迟: {asr_ms} ms")
+        if llm_ms >= 0:
+            logging.info(f"模型推理延迟: {llm_ms} ms")
+        if json_ms >= 0:
+            logging.info(f"JSON提取与校验延迟: {json_ms} ms")
+        if submit_ms >= 0:
+            logging.info(f"指令发送延迟: {submit_ms} ms")
+        if host_total_ms >= 0:
+            logging.info(f"主机侧总耗时: {host_total_ms} ms")
+
+        if task_info:
+            task_status = task_info.get("status", "")
+            created_at = task_info.get("created_at")
+            started_at = task_info.get("started_at")
+            finished_at = task_info.get("finished_at")
+            if created_at and started_at:
+                queue_wait_ms = round((started_at - created_at) * 1000.0, 2)
+                logging.info(f"机器狗端队列等待时间: {queue_wait_ms} ms")
+            if started_at and finished_at:
+                exec_ms = round((finished_at - started_at) * 1000.0, 2)
+                logging.info(f"机器狗端执行时间: {exec_ms} ms")
+            if created_at and finished_at:
+                server_total_ms = round((finished_at - created_at) * 1000.0, 2)
+                logging.info(f"机器狗端总耗时: {server_total_ms} ms")
+
+        # 端到端响应延迟：到机器狗“开始执行”为止，不包含动作完整执行时长
+        if host_total_ms >= 0 and queue_wait_ms is not None:
+            end_to_end_response_ms = round(host_total_ms + queue_wait_ms, 2)
+            logging.info(f"端到端响应延迟: {end_to_end_response_ms} ms")
+        elif host_total_ms >= 0:
+            end_to_end_response_ms = host_total_ms
+
+        if task_total_ms >= 0:
+            logging.info(f"任务总时长: {task_total_ms} ms")
+
+        row = {
+            "timestamp": self._latency_meta.get("timestamp", ""),
+            "mode": self._latency_meta.get("mode", ""),
+            "input_text": self._latency_meta.get("input_text", ""),
+            "asr_text": self._latency_meta.get("asr_text", ""),
+            "task_id": task_id,
+            "task_status": task_status,
+            "asr_latency_ms": asr_ms if asr_ms >= 0 else "",
+            "llm_latency_ms": llm_ms if llm_ms >= 0 else "",
+            "json_latency_ms": json_ms if json_ms >= 0 else "",
+            "http_submit_latency_ms": submit_ms if submit_ms >= 0 else "",
+            "host_total_ms": host_total_ms if host_total_ms >= 0 else "",
+            "end_to_end_response_ms": end_to_end_response_ms if end_to_end_response_ms is not None else "",
+            "server_queue_wait_ms": queue_wait_ms if queue_wait_ms is not None else "",
+            "server_exec_ms": exec_ms if exec_ms is not None else "",
+            "server_total_ms": server_total_ms if server_total_ms is not None else "",
+            "task_total_ms": task_total_ms if task_total_ms >= 0 else "",
+            "error": error,
+        }
+        self._write_latency_csv(row)
+        logging.info(f"延迟测试结果已写入 CSV: {self._latency_csv_path}")
+        logging.info("===================")
+        self._latency_reset()
+
+    def _poll_task_result_for_latency(self, task_id: str, poll_interval: float = 0.1, timeout: float = 120.0) -> None:
+        import requests
+
+        if not self._forwarder:
+            return
+
+        deadline = time.time() + timeout
+        url = f"http://{self._forwarder.dog_controller.dog_ip}:{self._forwarder.dog_controller.http_port}/result?task_id={task_id}"
+
+        while time.time() < deadline:
+            try:
+                resp = requests.get(url, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                task = data.get("task")
+                if task and task.get("status") in ["done", "failed", "cancelled"]:
+                    self._latency_log_summary(task)
+                    return
+            except Exception:
+                pass
+            time.sleep(poll_interval)
+
+        logging.warning("延迟测试：任务结果轮询超时")
+        self._latency_log_summary(None)
+
     def _append_text_safe(self, widget: tk.Text, msg: str) -> None:
         widget.after(0, lambda: (widget.insert(tk.END, msg), widget.see(tk.END)))
 

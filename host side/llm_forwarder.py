@@ -11,7 +11,7 @@
 5. 自动管理机器狗上的监听程序（启动/停止）
 
 使用方法：
-1. 启动转发程序：python llm_forwarder.py --dog-ip 192.168.1.100 --ollama-url http://localhost:11434 --model qwen3:4b
+1. 启动转发程序：python llm_forwarder.py --dog-ip 192.168.1.100 --ollama-url http://localhost:11434 --model qwen3-4b-instruct-new
 2. 在命令行界面中输入自然语言请求，程序会自动调用大模型并转发JSON指令
 3. 输入 'exit' 或 'quit' 退出程序，会自动清理机器狗上的监听程序
 """
@@ -27,7 +27,9 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from action_kb import build_augmented_prompt
 
 try:
     import requests
@@ -490,6 +492,224 @@ class DogController:
         except requests.exceptions.RequestException as e:
             return False, {"error": f"请求失败: {e}"}
 
+    def emergency_stop(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """立即急停并取消当前任务及后续队列"""
+        try:
+            response = requests.post(
+                f"{self.base_url}/emergency_stop",
+                timeout=5
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return True, result
+            return False, {"error": f"HTTP {response.status_code}: {response.text}"}
+        except requests.exceptions.RequestException as e:
+            return False, {"error": f"请求失败: {e}"}
+
+
+class JSONRepairer:
+    """修复中间语义 JSON 的近似输出。"""
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        normalized = text.strip().replace("﻿", "").replace("​", "")
+        normalized = normalized.replace("None", "null")
+        normalized = re.sub(r",\s*([}\]])", r"\1", normalized)
+        return normalized
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.DOTALL)
+
+    @staticmethod
+    def _repair_common_artifacts(text: str) -> str:
+        repaired = text
+        repaired = re.sub(
+            r'\{\s*"step_id"\s*:\s*(?:或|or|and)\s*\{\s*"step_id"\s*:\s*',
+            '{"step_id": ',
+            repaired,
+            flags=re.IGNORECASE,
+        )
+        repaired = re.sub(
+            r'("step_id"\s*:\s*)(?:或|or|and)\s*(-?\d+(?:\.0+)?)',
+            r'\1\2',
+            repaired,
+            flags=re.IGNORECASE,
+        )
+        repaired = re.sub(
+            r'(?<=\})\s*(?:,?\s*(?:或|or|and)\s*)+(?=\{)',
+            ', ',
+            repaired,
+            flags=re.IGNORECASE,
+        )
+        return repaired
+
+    @staticmethod
+    def _build_parse_candidates(text: str) -> List[str]:
+        normalized = JSONRepairer._normalize_text(text)
+        if not normalized:
+            return []
+
+        candidates: List[str] = []
+        for candidate in [normalized, JSONRepairer._strip_code_fence(normalized)]:
+            if not candidate:
+                continue
+            candidates.append(candidate)
+            candidates.append(JSONRepairer._repair_common_artifacts(candidate))
+
+        unique_candidates: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        return unique_candidates
+
+    @staticmethod
+    def _coerce_json_like(text: str) -> Optional[Any]:
+        for candidate in JSONRepairer._build_parse_candidates(text):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+            single_quote_candidate = candidate
+            if "'" in single_quote_candidate and '"' not in single_quote_candidate:
+                single_quote_candidate = single_quote_candidate.replace("'", '"')
+                try:
+                    return json.loads(single_quote_candidate)
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    @staticmethod
+    def repair(payload: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        if payload is None:
+            return None, []
+
+        repairs: List[str] = []
+        if not isinstance(payload, dict):
+            return None, repairs
+
+        if isinstance(payload.get("action_sequence"), dict):
+            payload["action_sequence"] = [payload["action_sequence"]]
+            repairs.append("action_sequence_dict_to_list")
+
+        sequence = payload.get("action_sequence")
+        if not isinstance(sequence, list):
+            return payload, repairs
+
+        normalized_sequence = []
+        for idx, step in enumerate(sequence, start=1):
+            if not isinstance(step, dict):
+                continue
+            fixed_step = dict(step)
+
+            if "action_type" not in fixed_step and "type" in fixed_step:
+                return None, repairs
+            if "action_name" not in fixed_step and "name" in fixed_step:
+                return None, repairs
+            if "direction" not in fixed_step and "dir" in fixed_step:
+                return None, repairs
+            if "step_id" not in fixed_step and "step" in fixed_step:
+                return None, repairs
+            fixed_step.pop("result", None)
+            fixed_step.pop("success", None)
+            if "target" not in fixed_step:
+                fixed_step["target"] = {}
+                repairs.append("add_empty_target")
+            if fixed_step.get("target") is None:
+                fixed_step["target"] = {}
+                repairs.append("null_target_to_empty")
+            if not isinstance(fixed_step.get("target"), dict):
+                return None, repairs
+            if "direction" in fixed_step["target"] and "direction" not in fixed_step:
+                fixed_step["direction"] = fixed_step["target"].pop("direction")
+                repairs.append("promote_target_direction")
+            else:
+                fixed_step["target"].pop("direction", None)
+            if "distance" in fixed_step.get("target", {}) and "distance_m" not in fixed_step["target"]:
+                fixed_step["target"]["distance_m"] = fixed_step["target"].pop("distance")
+                repairs.append("distance_to_distance_m")
+            if "angle" in fixed_step.get("target", {}) and "angle_deg" not in fixed_step["target"]:
+                fixed_step["target"]["angle_deg"] = fixed_step["target"].pop("angle")
+                repairs.append("angle_to_angle_deg")
+            fixed_step["step_id"] = idx
+            normalized_sequence.append(fixed_step)
+
+        payload["action_sequence"] = normalized_sequence
+        payload["action_count"] = len(normalized_sequence)
+        repairs.append("normalize_action_count")
+        return payload, repairs
+
+
+class JSONPostProcessor:
+    @staticmethod
+    def align_with_query(payload: Optional[Dict[str, Any]], user_input: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        if payload is None or not isinstance(payload, dict):
+            return payload, []
+        sequence = payload.get("action_sequence")
+        if not isinstance(sequence, list):
+            return payload, []
+
+        fixes: List[str] = []
+        normalized_sequence: List[Dict[str, Any]] = []
+        previous_signature = None
+
+        for step in sequence:
+            if not isinstance(step, dict):
+                fixes.append("drop_non_dict_step")
+                continue
+            fixed_step = dict(step)
+            action_type = fixed_step.get("action_type")
+            target = fixed_step.get("target") if isinstance(fixed_step.get("target"), dict) else {}
+            fixed_step["target"] = target
+
+            if "direction" in target and "direction" not in fixed_step:
+                fixed_step["direction"] = target.pop("direction")
+                fixes.append("promote_target_direction")
+            else:
+                target.pop("direction", None)
+
+            if action_type in {"trick", "state_control", "safety", "gait_switch"} and "direction" in fixed_step:
+                fixed_step.pop("direction", None)
+                fixes.append(f"drop_direction:{action_type}")
+
+            fixed_step.pop("result", None)
+            fixed_step.pop("success", None)
+
+            signature = json.dumps({
+                "action_type": fixed_step.get("action_type"),
+                "action_name": fixed_step.get("action_name"),
+                "direction": fixed_step.get("direction"),
+                "target": fixed_step.get("target", {})
+            }, ensure_ascii=False, sort_keys=True)
+            if signature == previous_signature:
+                fixes.append("drop_adjacent_duplicate_step")
+                continue
+            previous_signature = signature
+            normalized_sequence.append(fixed_step)
+
+        for idx, step in enumerate(normalized_sequence, start=1):
+            step["step_id"] = idx
+        payload["action_sequence"] = normalized_sequence
+        payload["action_count"] = len(normalized_sequence)
+        if normalized_sequence:
+            fixes.append("renumber_steps")
+            fixes.append("recount_actions")
+        return payload, fixes
+
+
+class JSONPipeline:
+    """统一的 JSON 提取、纠错与校验入口。"""
+
+    @staticmethod
+    def extract_repair_and_validate(text: str, user_input: str = "") -> Tuple[Optional[Dict[str, Any]], List[str], Tuple[bool, str]]:
+        payload = JSONExtractor.extract_json(text)
+        fixes: List[str] = []
+        if payload:
+            payload, fixes = JSONPostProcessor.align_with_query(payload, user_input)
+        valid, reason = JSONExtractor.validate_command_with_reason(payload) if payload else (False, "extract_failed")
+        return payload, fixes, (valid, reason)
+
 
 class JSONExtractor:
     """从文本中提取JSON指令"""
@@ -545,58 +765,29 @@ class JSONExtractor:
     
     @staticmethod
     def extract_json(text: str) -> Optional[Dict[str, Any]]:
-        """从文本中提取第一个有效的JSON对象（已过滤think部分）"""
-        # 先过滤think内容
+        """从文本中提取第一个有效的中间语义JSON对象（已过滤think部分）"""
         text = JSONExtractor.filter_think_content(text)
-        
-        # 尝试直接解析整个文本
+        text = JSONRepairer._normalize_text(text)
         text = text.strip()
         if not text:
             return None
-        
-        # 方法1: 尝试直接解析
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict) and "actions" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
-        
-        # 方法2: 查找JSON代码块（```json ... ``` 或 ``` ... ```）
+
+        coerced = JSONRepairer._coerce_json_like(text)
+        if isinstance(coerced, dict):
+            repaired, _ = JSONRepairer.repair(coerced)
+            if isinstance(repaired, dict) and "action_sequence" in repaired:
+                return repaired
+
         json_block_pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
         matches = re.findall(json_block_pattern, text, re.DOTALL)
         for match in matches:
-            try:
-                data = json.loads(match)
-                if isinstance(data, dict) and "actions" in data:
-                    return data
-            except json.JSONDecodeError:
-                continue
-        
-        # 方法3: 查找第一个 { ... } 结构
-        brace_start = text.find('{')
-        if brace_start == -1:
-            return None
-        
-        # 从第一个 { 开始，尝试找到匹配的 }
-        brace_count = 0
-        for i in range(brace_start, len(text)):
-            if text[i] == '{':
-                brace_count += 1
-            elif text[i] == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    json_str = text[brace_start:i+1]
-                    try:
-                        data = json.loads(json_str)
-                        if isinstance(data, dict) and "actions" in data:
-                            return data
-                    except json.JSONDecodeError:
-                        pass
-                    break
+            data = JSONRepairer._coerce_json_like(match)
+            if isinstance(data, dict):
+                repaired, _ = JSONRepairer.repair(data)
+                if isinstance(repaired, dict) and "action_sequence" in repaired:
+                    return repaired
 
-        # 方法4: 提取所有包含 code 字段的 JSON 对象，包装成 actions 格式
-        actions = []
+        candidate_payloads: List[Dict[str, Any]] = []
         pos = 0
         while pos < len(text):
             brace_start = text.find('{', pos)
@@ -611,45 +802,110 @@ class JSONExtractor:
                     brace_count -= 1
                     if brace_count == 0:
                         json_str = text[brace_start:i+1]
-                        try:
-                            data = json.loads(json_str)
-                            if isinstance(data, dict) and 'code' in data:
-                                actions.append(data)
-                        except json.JSONDecodeError:
-                            pass
+                        data = JSONRepairer._coerce_json_like(json_str)
+                        if isinstance(data, dict):
+                            repaired, _ = JSONRepairer.repair(data)
+                            if isinstance(repaired, dict):
+                                candidate_payloads.append(repaired)
                         end_pos = i + 1
                         break
             if end_pos == brace_start:
                 break
             pos = end_pos
-        if actions:
-            return {"actions": actions}
+
+        for payload in reversed(candidate_payloads):
+            if isinstance(payload, dict) and "action_sequence" in payload:
+                return payload
 
         return None
 
     @staticmethod
     def validate_command(payload: Dict[str, Any]) -> bool:
-        """验证指令格式"""
+        valid, _ = JSONExtractor.validate_command_with_reason(payload)
+        return valid
+
+    @staticmethod
+    def validate_command_with_reason(payload: Dict[str, Any]) -> Tuple[bool, str]:
         if not isinstance(payload, dict):
-            return False
-        
-        if "actions" not in payload:
-            return False
-        
-        if not isinstance(payload["actions"], list):
-            return False
-        
-        if len(payload["actions"]) == 0:
-            return False
-        
-        # 验证每个action的格式
-        for action in payload["actions"]:
+            return False, "payload_not_dict"
+        if "action_sequence" not in payload:
+            return False, "missing_action_sequence"
+        if not isinstance(payload["action_sequence"], list):
+            return False, "action_sequence_not_list"
+        if len(payload["action_sequence"]) == 0:
+            return False, "action_sequence_empty"
+        if "action_count" in payload and payload["action_count"] != len(payload["action_sequence"]):
+            return False, "action_count_mismatch"
+
+        allowed_step_keys = {"step_id", "action_type", "action_name", "direction", "target"}
+        for index, action in enumerate(payload["action_sequence"]):
             if not isinstance(action, dict):
-                return False
-            if "code" not in action:
-                return False
-        
-        return True
+                return False, f"step_{index}_not_dict"
+            extra_keys = set(action.keys()) - allowed_step_keys
+            if extra_keys:
+                return False, f"step_{index}_unexpected_keys:{sorted(extra_keys)}"
+            if "step_id" not in action:
+                return False, f"step_{index}_missing_step_id"
+            if action.get("step_id") != index + 1:
+                return False, f"step_{index}_non_contiguous_step_id"
+            if not action.get("action_type"):
+                return False, f"step_{index}_missing_action_type"
+            if not action.get("action_name"):
+                return False, f"step_{index}_missing_action_name"
+            if "target" not in action:
+                return False, f"step_{index}_missing_target"
+            if not isinstance(action.get("target"), dict):
+                return False, f"step_{index}_invalid_target"
+
+            action_type = action.get("action_type")
+            action_name = action.get("action_name")
+            direction = action.get("direction")
+            target = action.get("target", {})
+
+            if action_type == "locomotion":
+                if action_name == "move":
+                    if direction not in {"forward", "backward", "left", "right"}:
+                        return False, f"step_{index}_invalid_move_direction"
+                    if set(target.keys()) != {"distance_m"}:
+                        return False, f"step_{index}_invalid_move_target_keys"
+                elif action_name == "turn":
+                    if direction not in {"left", "right"}:
+                        return False, f"step_{index}_invalid_turn_direction"
+                    if set(target.keys()) != {"angle_deg"}:
+                        return False, f"step_{index}_invalid_turn_target_keys"
+                else:
+                    return False, f"step_{index}_invalid_locomotion_action_name"
+            elif action_type == "gait_switch":
+                if action_name != "set_gait":
+                    return False, f"step_{index}_invalid_gait_action_name"
+                if direction is not None:
+                    return False, f"step_{index}_gait_should_not_have_direction"
+                if set(target.keys()) != {"gait"}:
+                    return False, f"step_{index}_invalid_gait_target_keys"
+            elif action_type == "posture_adjust":
+                if action_name != "adjust_posture":
+                    return False, f"step_{index}_invalid_posture_action_name"
+                if "axis" not in target or "value" not in target:
+                    return False, f"step_{index}_missing_posture_target"
+            elif action_type == "trick":
+                if direction is not None:
+                    return False, f"step_{index}_trick_should_not_have_direction"
+                if target != {}:
+                    return False, f"step_{index}_trick_target_not_empty"
+            elif action_type == "state_control":
+                if direction is not None:
+                    return False, f"step_{index}_state_should_not_have_direction"
+                if target != {}:
+                    return False, f"step_{index}_state_target_not_empty"
+            elif action_type == "safety":
+                if direction is not None:
+                    return False, f"step_{index}_safety_should_not_have_direction"
+                if target != {}:
+                    return False, f"step_{index}_safety_target_not_empty"
+            else:
+                return False, f"step_{index}_unknown_action_type"
+
+        return True, "valid"
 
 
 class OllamaAPIProxy:
@@ -760,9 +1016,10 @@ class OllamaAPIProxy:
                             
                             # 实时检测JSON指令（每累积一定内容就检查一次）
                             if accumulated_text and not json_sent and len(accumulated_text) > 50:
-                                # 尝试提取JSON
-                                json_data = forwarder.json_extractor.extract_json(accumulated_text)
-                                if json_data and forwarder.json_extractor.validate_command(json_data):
+                                json_data, post_fixes, (json_valid, _) = JSONPipeline.extract_repair_and_validate(accumulated_text)
+                                if post_fixes:
+                                    logging.info(f"JSON 后修复: {post_fixes}")
+                                if json_data and json_valid:
                                     json_sent = True  # 标记已发送，避免重复
                                     def forward_command():
                                         logging.info("从ollama响应中检测到JSON指令，正在转发到机器狗...")
@@ -773,13 +1030,15 @@ class OllamaAPIProxy:
                                         else:
                                             error = result.get("error") if result else "未知错误"
                                             logging.error(f"✗ 指令发送失败: {error}")
-                                    
+
                                     threading.Thread(target=forward_command, daemon=True).start()
                     
                     # 如果流式响应结束时还没有检测到JSON，最后再检查一次完整内容
                     if accumulated_text and not json_sent:
-                        json_data = forwarder.json_extractor.extract_json(accumulated_text)
-                        if json_data and forwarder.json_extractor.validate_command(json_data):
+                        json_data, post_fixes, (json_valid, _) = JSONPipeline.extract_repair_and_validate(accumulated_text)
+                        if post_fixes:
+                            logging.info(f"JSON 后修复: {post_fixes}")
+                        if json_data and json_valid:
                             logging.info("从ollama响应中检测到JSON指令，正在转发到机器狗...")
                             success, result = forwarder.dog_controller.send_command(json_data)
                             if success:
@@ -846,7 +1105,7 @@ class LLMForwarder:
         self.json_extractor = JSONExtractor()
         self.running = True
         self._ollama_url = ollama_url or "http://localhost:11434"
-        self._model = model or "qwen3-dog"
+        self._model = model or "qwen3-4b-instruct-new"
         
         # 注册信号处理（仅在主线程中且启用时才注册，GUI 环境中应禁用）
         if enable_signal_handler:
@@ -868,20 +1127,26 @@ class LLMForwarder:
     def call_ollama_api(self, prompt: str, stream: bool = True) -> str:
         """调用Ollama API获取响应（支持流式输出）"""
         try:
-            api_url = f"{self._ollama_url}/api/generate"
-            alpaca_prompt = (
-                "Below is an instruction that describes a task, paired with an input that provides further context. "
-                "Write a response that appropriately completes the request.\n\n"
-                "### Instruction:\n"
-                "你是一个机器狗控制助手，将用户的自然语言命令转换为JSON格式的控制指令。如果用户命令包含多个动作，必须将所有动作都输出，每个动作单独一行。\n\n"
-                f"### Input:\n{prompt}\n\n"
-                "### Response:\n"
+            api_url = f"{self._ollama_url}/api/chat"
+            augmented_prompt, kb_debug = build_augmented_prompt(prompt)
+            logging.info(
+                "构造单轮聊天请求: retrieve_ms=%sms%s",
+                kb_debug.get("retrieve_ms", 0),
+                " (fallback)" if kb_debug.get("used_fallback") else "",
             )
             payload = {
                 "model": self._model,
-                "prompt": alpaca_prompt,
+                "messages": [
+                    {"role": "system", "content": kb_debug.get("system_instruction", "")},
+                    {"role": "user", "content": prompt}
+                ],
                 "stream": stream,
-                "context": []
+                "options": {
+                    "Think": False,
+                    "temperature": 0.95,
+                    "top_p": 0.7,
+                    "num_predict": 512
+                }
             }
             
             if stream:
@@ -892,7 +1157,7 @@ class LLMForwarder:
                 
                 full_response = ""
                 print()  # 换行，使输出更清晰
-                
+
                 # 解析SSE格式的流式响应
                 line_count = 0
                 for line in response.iter_lines():
@@ -922,23 +1187,24 @@ class LLMForwarder:
                             
                             # 解析JSON
                             data = json.loads(json_str)
-                            
-                            # 提取响应片段（包含thinking和response）
-                            # Ollama API可能返回thinking字段（思考过程）
+
                             if "thinking" in data:
                                 thinking_chunk = data["thinking"]
                                 if thinking_chunk:
-                                    # thinking内容也累积到full_response中，但单独显示
                                     full_response += f"[思考] {thinking_chunk}\n"
                                     print(f"[思考] {thinking_chunk}", flush=True)
-                            
-                            if "response" in data:
+
+                            chunk = None
+                            message = data.get("message")
+                            if isinstance(message, dict):
+                                chunk = message.get("content")
+                            if chunk is None and "response" in data:
                                 chunk = data["response"]
-                                if chunk:  # 只处理非空响应
-                                    full_response += chunk
-                                    # 实时显示，不换行（使用end=''）
-                                    print(chunk, end='', flush=True)
-                            
+
+                            if chunk:
+                                full_response += chunk
+                                print(chunk, end='', flush=True)
+
                             # 检查是否完成
                             if data.get("done", False):
                                 break
@@ -965,20 +1231,21 @@ class LLMForwarder:
                 
                 if not full_response:
                     logging.warning("流式输出未收到任何响应内容")
-                
+
                 return full_response
             else:
-                # 非流式输出（兼容旧代码）
+                # 非流式输出
                 logging.debug(f"正在请求Ollama API: {api_url}, 模型: {self._model}")
-                response = requests.post(api_url, json=payload, timeout=300)  # 增加超时时间到5分钟
+                response = requests.post(api_url, json=payload, timeout=300)
                 response.raise_for_status()
-                
+
                 result = response.json()
-                # 提取响应文本
+                message = result.get("message")
+                if isinstance(message, dict) and "content" in message:
+                    return message["content"]
                 if "response" in result:
                     return result["response"]
-                else:
-                    return str(result)
+                return str(result)
         except requests.exceptions.Timeout as e:
             logging.error(f"调用Ollama API超时（可能模型响应时间过长）: {e}")
             return ""
@@ -1041,10 +1308,16 @@ class LLMForwarder:
                         logging.warning("大模型未返回响应")
                         continue
                     
-                    # 提取JSON指令
-                    json_data = self.json_extractor.extract_json(response_text)
-                    if json_data and self.json_extractor.validate_command(json_data):
-                        logging.info("检测到JSON指令，正在转发到机器狗...")
+                    # 提取、纠错并校验 JSON 指令
+                    json_data, post_fixes, (json_valid, json_reason) = JSONPipeline.extract_repair_and_validate(
+                        response_text,
+                        user_input,
+                    )
+                    if post_fixes:
+                        logging.info(f"JSON 后修复: {post_fixes}")
+
+                    if json_data and json_valid:
+                        logging.info(f"检测到JSON指令，校验原因: {json_reason}，正在转发到机器狗...")
                         success, result = self.dog_controller.send_command(json_data)
                         
                         if success:
@@ -1054,7 +1327,11 @@ class LLMForwarder:
                             error = result.get("error") if result else "未知错误"
                             logging.error(f"✗ 指令发送失败: {error}")
                     else:
-                        logging.info("响应中未检测到有效的JSON指令")
+                        preview = response_text[:300].replace("\n", "\\n")
+                        logging.info(f"响应中未检测到有效的JSON指令，原因: {json_reason}")
+                        logging.info(f"模型输出摘要: {preview}")
+                        if json_data:
+                            logging.info(f"提取后的候选 JSON: {json_data}")
                     
                     print()  # 空行分隔
                     
@@ -1152,20 +1429,22 @@ class LLMForwarder:
                         buffer += new_content
                         last_size = current_size
                         
-                        # 尝试提取JSON
+                        # 尝试提取、纠错并校验 JSON
                         if buffer.strip():
-                            json_data = self.json_extractor.extract_json(buffer)
-                            if json_data and self.json_extractor.validate_command(json_data):
+                            json_data, post_fixes, (json_valid, _) = JSONPipeline.extract_repair_and_validate(buffer)
+                            if post_fixes:
+                                logging.info(f"JSON 后修复: {post_fixes}")
+                            if json_data and json_valid:
                                 logging.info("检测到JSON指令，正在转发...")
                                 success, result = self.dog_controller.send_command(json_data)
-                                
+
                                 if success:
                                     task_id = result.get("task_id") if result else None
                                     logging.info(f"✓ 指令已发送，任务ID: {task_id}")
                                 else:
                                     error = result.get("error") if result else "未知错误"
                                     logging.error(f"✗ 指令发送失败: {error}")
-                                
+
                                 # 清空缓冲区（已处理）
                                 buffer = ""
                             else:
@@ -1226,20 +1505,22 @@ class LLMForwarder:
                         break
                     buffer += chunk
                 
-                # 尝试提取JSON
+                # 尝试提取、纠错并校验 JSON
                 if buffer.strip():
-                    json_data = self.json_extractor.extract_json(buffer)
-                    if json_data and self.json_extractor.validate_command(json_data):
+                    json_data, post_fixes, (json_valid, _) = JSONPipeline.extract_repair_and_validate(buffer)
+                    if post_fixes:
+                        logging.info(f"JSON 后修复: {post_fixes}")
+                    if json_data and json_valid:
                         logging.info("检测到JSON指令，正在转发...")
                         success, result = self.dog_controller.send_command(json_data)
-                        
+
                         if success:
                             task_id = result.get("task_id") if result else None
                             logging.info(f"✓ 指令已发送，任务ID: {task_id}")
                         else:
                             error = result.get("error") if result else "未知错误"
                             logging.error(f"✗ 指令发送失败: {error}")
-                        
+
                         # 清空缓冲区（已处理）
                         buffer = ""
                     else:
@@ -1256,11 +1537,13 @@ class LLMForwarder:
     
     def forward_from_text(self, text: str) -> bool:
         """从文本中提取并转发指令（用于API调用场景）"""
-        json_data = self.json_extractor.extract_json(text)
-        if json_data and self.json_extractor.validate_command(json_data):
+        json_data, post_fixes, (json_valid, json_reason) = JSONPipeline.extract_repair_and_validate(text)
+        if post_fixes:
+            logging.info(f"JSON 后修复: {post_fixes}")
+        if json_data and json_valid:
             logging.info("检测到JSON指令，正在转发...")
             success, result = self.dog_controller.send_command(json_data)
-            
+
             if success:
                 task_id = result.get("task_id") if result else None
                 logging.info(f"✓ 指令已发送，任务ID: {task_id}")
@@ -1269,6 +1552,7 @@ class LLMForwarder:
                 error = result.get("error") if result else "未知错误"
                 logging.error(f"✗ 指令发送失败: {error}")
                 return False
+        logging.info(f"响应中未检测到有效的JSON指令，原因: {json_reason}")
         return False
 
 
@@ -1347,8 +1631,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="qwen3:4b",
-        help="Ollama模型名称（默认：qwen3:4b）"
+        default="qwen3-4b-instruct-new",
+        help="Ollama模型名称（默认：qwen3-4b-instruct-new）"
     )
     
     args = parser.parse_args()
