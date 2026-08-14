@@ -1,6 +1,6 @@
 # Robot-Dog-Control-Based-on-LLM
 
-基于大语言模型（LLM）指令控制的机器狗运动控制系统。主机端通过本地大模型将自然语言/语音指令解析为**中间语义 JSON**，经 HTTP 转发给机器狗端监听服务，由机器狗端解析并执行对应动作（移动、步态切换、姿态调整、特技、急停等）。
+基于大语言模型（LLM）指令控制的机器狗运动控制系统。主机端通过本地大模型将自然语言/语音指令解析为**中间语义 JSON**，经 HTTP 转发给机器狗端监听服务，由机器狗端解析并执行对应动作（移动、步态切换、姿态调整、特技、急停等）。中间语义方案大大增强了本项目的跨平台能力，不仅能部署在云深处机器狗，还能部署在其他品牌机器狗平台，甚至机器人平台，只需要修改解析映射部分代码。
 
 LLM-based motion control system for quadruped robots. Natural language / voice commands are parsed into **intermediate semantic JSON** by a local LLM running on the host, forwarded to the robot-side listening service over HTTP, and then executed as actual motions (locomotion, gait switching, posture adjustment, tricks, emergency stop, etc.).
 
